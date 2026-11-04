@@ -53,7 +53,6 @@ bot = Client(
 
 # ==================== HELPER: REAL-TIME PROGRESS BAR ====================
 async def show_progress_bar(msg: Message, action_name: str, total_steps: int = 5):
-    """Generates an animated real-time process progress bar."""
     for step in range(1, total_steps + 1):
         percent = int((step / total_steps) * 100)
         filled = "█" * step
@@ -69,8 +68,8 @@ async def show_progress_bar(msg: Message, action_name: str, total_steps: int = 5
             )
         except MessageNotModified:
             pass
-        except Exception as e:
-            logger.debug(f"Progress bar edit notice: {e}")
+        except Exception:
+            pass
         await asyncio.sleep(0.3)
 
 
@@ -121,9 +120,8 @@ class UserWorkspace:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            logger.debug(f"PulseAudio sink {self.sink_name} initialized for user {self.user_id}")
-        except Exception as e:
-            logger.debug(f"PulseAudio sink creation notice for user {self.user_id}: {e}")
+        except Exception:
+            pass
 
     async def save_to_mongo(self):
         doc = {
@@ -173,9 +171,8 @@ class UserWorkspace:
             "-i", self.fifo_path, "-f", "pulse", self.sink_name,
         ]
         self.ffmpeg_proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+            *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        logger.info(f"FFmpeg audio bridge started for user {self.user_id}")
 
     async def stop_bridge(self):
         if self.ffmpeg_proc:
@@ -185,7 +182,6 @@ class UserWorkspace:
             except Exception:
                 pass
             self.ffmpeg_proc = None
-            logger.info(f"FFmpeg audio bridge stopped for user {self.user_id}")
 
     async def set_recorder(self, session_str: str, save: bool = True) -> bool:
         if not session_str:
@@ -204,9 +200,13 @@ class UserWorkspace:
                 in_memory=True,
                 no_updates=True,
             )
-            c_cli = PyTgCalls(u_cli)
             await u_cli.start()
-            await c_cli.start()
+            c_cli = PyTgCalls(u_cli)
+            try:
+                await c_cli.start()
+            except Exception as call_err:
+                logger.warning(f"PyTgCalls start notice (Recorder): {call_err}")
+
             self.recorder_user = u_cli
             self.recorder_call = c_cli
             self.recorder_session = session_str
@@ -230,9 +230,13 @@ class UserWorkspace:
                 in_memory=True,
                 no_updates=True,
             )
-            c_cli = PyTgCalls(u_cli)
             await u_cli.start()
-            await c_cli.start()
+            c_cli = PyTgCalls(u_cli)
+            try:
+                await c_cli.start()
+            except Exception as call_err:
+                logger.warning(f"PyTgCalls start notice (Broadcaster): {call_err}")
+
             self.broadcaster_users.append(u_cli)
             self.broadcaster_calls.append(c_cli)
             if save and session_str not in self.broadcaster_sessions:
@@ -279,7 +283,6 @@ class UserWorkspace:
                 pass
         await self.stop_bridge()
         self.recording = False
-        logger.info(f"User {self.user_id} left all calls.")
         return count
 
 
@@ -319,7 +322,6 @@ class GlobalManager:
             {"$set": {"approved_users": list(self.approved_users), "banned_users": list(self.banned_users)}},
             upsert=True,
         )
-        logger.info("Global access list synced to MongoDB.")
 
     async def get_ws(self, user_id: int) -> UserWorkspace:
         if user_id not in self.workspaces:
@@ -351,7 +353,6 @@ async def handle_unauthorized_user(client: Client, message: Message):
         return await message.reply_text("🚫 **You are BANNED from using this bot.**")
 
     user_tag = f"@{user.username}" if user.username else user.mention
-    logger.warning(f"Unauthorized access attempt by user {user.id} ({user_tag})")
     restricted_text = (
         f"⛔  **ACCESS RESTRICTED**\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -540,7 +541,6 @@ async def start_cmd(client: Client, message: Message):
         return await handle_unauthorized_user(client, message)
 
     uid = message.from_user.id
-    logger.info(f"User {uid} sent /start command.")
     await MANAGER.get_ws(uid)
     await message.reply_text(
         START_UI.format(mention=message.from_user.mention),
@@ -562,7 +562,6 @@ async def handle_access_request_buttons(client: Client, query: CallbackQuery):
         MANAGER.approved_users.add(target_uid)
         MANAGER.notified_pending.discard(target_uid)
         await MANAGER.save_access_to_mongo()
-        logger.info(f"Owner approved user ID {target_uid}")
 
         try:
             await query.message.edit_text(f"{query.message.text}\n\n✅ **STATUS: APPROVED BY OWNER**")
@@ -578,14 +577,13 @@ async def handle_access_request_buttons(client: Client, query: CallbackQuery):
                 "You now have full access to the bot and all menus below:",
                 reply_markup=main_menu_kb(target_uid),
             )
-        except Exception as e:
-            logger.error(f"Failed sending approval notice to user {target_uid}: {e}")
+        except Exception:
+            pass
     else:
         MANAGER.approved_users.discard(target_uid)
         MANAGER.banned_users.add(target_uid)
         MANAGER.notified_pending.discard(target_uid)
         await MANAGER.save_access_to_mongo()
-        logger.info(f"Owner banned user ID {target_uid}")
 
         try:
             await query.message.edit_text(f"{query.message.text}\n\n🚫 **STATUS: BANNED BY OWNER**")
@@ -607,7 +605,6 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
     uid = query.from_user.id
     ws = await MANAGER.get_ws(uid)
     menu = query.data
-    logger.debug(f"User {uid} clicked menu: {menu}")
 
     try:
         if menu == "menu_main":
@@ -634,7 +631,7 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
                 reply_markup=fx_menu_kb(ws),
             )
         elif menu == "menu_acc":
-            rec_s = "✅ Saved in DB" if ws.recorder_user else "❌ Not Set"
+            rec_s = "✅ Active" if ws.recorder_user else ("⚠️ Saved in DB (Unloaded)" if ws.recorder_session else "❌ Not Set")
             await query.message.edit_text(
                 f"📱 **My Accounts (MongoDB Saved)**\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -668,11 +665,9 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
             )
     except MessageNotModified:
         await query.answer()
-    except Exception as e:
-        logger.error(f"Error handling menu {menu}: {e}")
 
 
-# ==================== AUDIO ACTIONS WITH PROGRESS BAR ====================
+# ==================== AUDIO ACTIONS ====================
 @bot.on_callback_query(filters.regex(r"^act_"))
 async def audio_actions_callbacks(client: Client, query: CallbackQuery):
     if not is_authorized(None, None, query):
@@ -703,11 +698,8 @@ async def audio_actions_callbacks(client: Client, query: CallbackQuery):
             ws.source_chat, RecordStream(ws.fifo_path, AudioParameters(bitrate=48000, channels=2))
         )
         ws.recording = True
-        logger.info(f"User {uid} started recording on chat {ws.source_chat}")
         try:
-            await p_msg.edit_text(
-                f"✅ **Recording active on `{ws.source_chat}`!**", reply_markup=audio_menu_kb(ws)
-            )
+            await p_msg.edit_text(f"✅ **Recording active on `{ws.source_chat}`!**", reply_markup=audio_menu_kb(ws))
         except MessageNotModified:
             pass
 
@@ -725,7 +717,6 @@ async def audio_actions_callbacks(client: Client, query: CallbackQuery):
 
             await ws.broadcaster_calls[b_idx].play(t_id, ws.get_target_stream())
             ws.targets[t_id] = b_idx
-            logger.info(f"User {uid} joined target chat {t_id}")
             try:
                 await p_msg.edit_text(f"✅ **Connected & streaming to `{t_id}`!**", reply_markup=audio_menu_kb(ws))
             except MessageNotModified:
