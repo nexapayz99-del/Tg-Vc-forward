@@ -40,7 +40,6 @@ bot = Client(
 
 # ==================== HELPER: REAL-TIME PROGRESS BAR ====================
 async def show_progress_bar(msg: Message, action_name: str, total_steps: int = 5):
-    """Generates an animated real-time process progress bar."""
     for step in range(1, total_steps + 1):
         percent = int((step / total_steps) * 100)
         filled = "█" * step
@@ -202,9 +201,8 @@ class UserWorkspace:
         if not session_str:
             return False
         try:
-            idx = len(self.broadcaster_users) + 1
             u_cli = Client(
-                f"Bcast_{self.user_id}_{idx}_{int(time.time())}",
+                f"Bcast_{self.user_id}_{len(self.broadcaster_users)+1}_{int(time.time())}",
                 api_id=config.API_ID,
                 api_hash=config.API_HASH,
                 session_string=session_str,
@@ -767,16 +765,64 @@ async def acc_actions_callbacks(client: Client, query: CallbackQuery):
             me = await tmp.get_me()
             await tmp.disconnect()
 
+            # FIX: Immediately initialize live runner instance upon successful save
             if role == "rec":
+                ws.recorder_session = s_str
+                await ws.set_recorder(s_str, save=True)
+            else:
+                if s_str not in ws.broadcaster_sessions:
+                    ws.broadcaster_sessions.append(s_str)
+                await ws.add_broadcaster(s_str, save=True)
+
+            await client.send_message(chat_id, f"✅ **Account Connected & Initialized!** ({me.first_name})", reply_markup=acc_menu_kb())
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
+
+    elif act in ("acc_rec_str", "acc_bcast_str"):
+        await query.answer()
+        label = "Recorder" if act == "acc_rec_str" else "Broadcaster"
+        ans = await client.ask(chat_id, f"🔑 **Send String Session for {label}:**", timeout=120)
+        if not ans.text.startswith("/cancel"):
+            s_str = ans.text.strip()
+            if act == "acc_rec_str":
                 await ws.set_recorder(s_str, save=True)
             else:
                 await ws.add_broadcaster(s_str, save=True)
-            await client.send_message(chat_id, f"✅ **Account Connected & Saved to DB!** ({me.first_name})", reply_markup=acc_menu_kb())
-        except Exception as e:
-            await client.send_message(chat_id, f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
+            await ans.reply_text(f"✅ **{label} Connected & Initialized!**", reply_markup=acc_menu_kb())
+
     elif act == "acc_view":
         b_cnt = len(ws.broadcaster_users)
-        await query.message.edit_text(f"📋 **Accounts in DB:**\nRecorder: {'✅' if ws.recorder_user else '❌'}\nBroadcasters: {b_cnt}", reply_markup=acc_menu_kb())
+        rec_status = "✅ Active" if ws.recorder_user else "❌ Not Set"
+        await query.message.edit_text(
+            f"📋 **Accounts in DB & Memory:**\n"
+            f"🎙️ Recorder Account: {rec_status}\n"
+            f"📡 Broadcaster Accounts: {b_cnt} active",
+            reply_markup=acc_menu_kb(),
+        )
+
+    elif act == "acc_del":
+        await query.answer()
+        ans = await client.ask(chat_id, "🗑️ Send `0` to delete Recorder, or `1, 2...` for Broadcaster:", timeout=60)
+        try:
+            num = int(ans.text.strip())
+            if num == 0:
+                if ws.recorder_user:
+                    await ws.recorder_user.stop()
+                ws.recorder_user = None
+                ws.recorder_call = None
+                ws.recorder_session = ""
+                await ws.save_to_mongo()
+                await ans.reply_text("✅ **Recorder deleted!**", reply_markup=acc_menu_kb())
+            else:
+                idx = num - 1
+                u_cli = ws.broadcaster_users.pop(idx)
+                ws.broadcaster_calls.pop(idx)
+                ws.broadcaster_sessions.pop(idx)
+                await ws.save_to_mongo()
+                await u_cli.stop()
+                await ans.reply_text(f"✅ **Broadcaster #{num} deleted!**", reply_markup=acc_menu_kb())
+        except Exception as e:
+            await ans.reply_text(f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
 
 
 # ==================== UTILITY & OWNER ACTIONS ====================
