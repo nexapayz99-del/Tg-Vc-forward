@@ -4,8 +4,23 @@ import time
 import asyncio
 import logging
 import subprocess
-import psutil
 from typing import Dict, Set, List, Optional
+
+# ==================== PYROMOD ANTI-CRASH PATCH ====================
+# Force Pyromod to recognize Pyrofork's ListenerTypes dictionary structure
+from pyrogram.handlers.handler import ListenerTypes
+from pyrogram.client import Client
+
+_orig_start = Client.start
+async def patched_start(self, *args, **kwargs):
+    if not hasattr(self, "listeners") or self.listeners is None:
+        self.listeners = {}
+    for l_type in [ListenerTypes.MESSAGE, ListenerTypes.CALLBACK_QUERY, ListenerTypes.INLINE_QUERY]:
+        if l_type not in self.listeners:
+            self.listeners[l_type] = []
+    return await _orig_start(self, *args, **kwargs)
+Client.start = patched_start
+# ===================================================================
 
 # ==================== PYROGRAM ANTI-CRASH PATCH ====================
 import pyrogram.errors
@@ -43,8 +58,9 @@ for _name in _FALLBACK_RAWS:
 # ===================================================================
 
 import pyromod
+import psutil
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client, filters
+from pyrogram import filters
 from pyrogram.types import (
     Message,
     CallbackQuery,
