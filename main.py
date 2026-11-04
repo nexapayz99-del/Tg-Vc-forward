@@ -1,3 +1,4 @@
+cat << 'EOF' > /opt/Tg-Vc-forward/main.py
 import os
 import sys
 import time
@@ -7,6 +8,7 @@ import psutil
 from typing import Dict, Set, List, Optional
 
 import pyromod
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
@@ -22,7 +24,12 @@ from pytgcalls.types.raw import AudioParameters
 import config
 
 START_TIME = time.time()
-DB = config.load_db()
+
+# ==================== MONGODB INITIALIZATION ====================
+mongo_client = AsyncIOMotorClient(config.MONGO_URI)
+db = mongo_client[config.DB_NAME]
+users_col = db["users"]       # Stores per-user accounts, source_chat, effects
+access_col = db["access"]     # Stores approved_users, banned_users, pending_requests
 
 bot = Client(
     "NobiFightBot",
@@ -34,44 +41,38 @@ bot = Client(
 
 # ==================== PER-USER ISOLATED WORKSPACE ====================
 class UserWorkspace:
-    """Isolated state, accounts, audio pipe, and DSP effects for a single Telegram user."""
-
-    def __init__(self, user_id: int, saved_data: dict):
+    def __init__(self, user_id: int, doc: dict):
         self.user_id = user_id
-        self.source_chat: Optional[int] = saved_data.get("source_chat")
+        self.source_chat: Optional[int] = doc.get("source_chat")
         self.recording: bool = False
         self.muted: bool = False
-
-        # Target Chat ID -> Broadcaster Index in this user's personal pool
         self.targets: Dict[int, int] = {}
 
-        # User's personal accounts (No other user can access these)
-        self.recorder_session: str = saved_data.get("recorder", "")
-        self.broadcaster_sessions: List[str] = list(saved_data.get("broadcasters", []))
+        self.recorder_session: str = doc.get("recorder", "")
+        self.broadcaster_sessions: List[str] = list(doc.get("broadcasters", []))
 
         self.recorder_user: Optional[Client] = None
         self.recorder_call: Optional[PyTgCalls] = None
         self.broadcaster_users: List[Client] = []
         self.broadcaster_calls: List[PyTgCalls] = []
 
-        # Dedicated Virtual Audio Pipe & PulseAudio Sink for this user
         self.fifo_path = f"/tmp/nobi_fifo_{user_id}.pcm"
         self.sink_name = f"FightSink_{user_id}"
-        self.sink_module_id: Optional[str] = None
         self.ffmpeg_proc: Optional[asyncio.subprocess.Process] = None
 
+        saved_fx = doc.get("effects", {})
         self.effects = {
-            "level": 1.0,
-            "bass": 0.0,
-            "treble": 0.0,
-            "gain": 0.0,
-            "overdrive": 0.0,
-            "echo": None,
+            "level": saved_fx.get("level", 1.0),
+            "bass": saved_fx.get("bass", 0.0),
+            "treble": saved_fx.get("treble", 0.0),
+            "gain": saved_fx.get("gain", 0.0),
+            "overdrive": saved_fx.get("overdrive", 0.0),
+            "echo": tuple(saved_fx["echo"]) if saved_fx.get("echo") else None,
         }
 
-        self._setup_user_audio_pipe()
+        self._setup_audio_pipe()
 
-    def _setup_user_audio_pipe(self):
+    def _setup_audio_pipe(self):
         if os.path.exists(self.fifo_path):
             try:
                 os.remove(self.fifo_path)
@@ -79,27 +80,34 @@ class UserWorkspace:
                 pass
         os.mkfifo(self.fifo_path)
 
-        # Create isolated PulseAudio null-sink for this user
         try:
-            res = subprocess.check_output(
+            subprocess.run(
                 [
                     "pactl",
                     "load-module",
                     "module-null-sink",
                     f"sink_name={self.sink_name}",
                 ],
-                text=True,
-            ).strip()
-            self.sink_module_id = res
-        except Exception as e:
-            print(f"[WARN] PulseAudio sink creation for {self.user_id}: {e}")
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
-    def to_dict(self) -> dict:
-        return {
+    async def save_to_mongo(self):
+        doc = {
+            "user_id": self.user_id,
             "recorder": self.recorder_session,
             "broadcasters": self.broadcaster_sessions,
             "source_chat": self.source_chat,
+            "effects": {
+                **self.effects,
+                "echo": list(self.effects["echo"]) if self.effects["echo"] else None,
+            },
         }
+        await users_col.update_one(
+            {"user_id": self.user_id}, {"$set": doc}, upsert=True
+        )
 
     def build_ffmpeg_filters(self) -> str:
         fx = self.effects
@@ -172,10 +180,10 @@ class UserWorkspace:
             self.recorder_call = c_cli
             self.recorder_session = session_str
             if save:
-                MANAGER.sync_db()
+                await self.save_to_mongo()
             return True
         except Exception as e:
-            print(f"[ERROR] User {self.user_id} Recorder failed: {e}")
+            print(f"[ERROR] User {self.user_id} Recorder error: {e}")
             return False
 
     async def add_broadcaster(self, session_str: str, save: bool = True) -> bool:
@@ -198,10 +206,10 @@ class UserWorkspace:
             self.broadcaster_calls.append(c_cli)
             if save and session_str not in self.broadcaster_sessions:
                 self.broadcaster_sessions.append(session_str)
-                MANAGER.sync_db()
+                await self.save_to_mongo()
             return True
         except Exception as e:
-            print(f"[ERROR] User {self.user_id} Broadcaster failed: {e}")
+            print(f"[ERROR] User {self.user_id} Broadcaster error: {e}")
             return False
 
     def get_free_broadcaster(self) -> Optional[int]:
@@ -221,7 +229,7 @@ class UserWorkspace:
                 if self.muted:
                     await self.broadcaster_calls[b_idx].mute_stream(t_id)
             except Exception as e:
-                print(f"[WARN] User {self.user_id} reload error on {t_id}: {e}")
+                print(f"[WARN] Reload failed on {t_id}: {e}")
 
     async def leave_all(self) -> int:
         count = len(self.targets)
@@ -242,49 +250,114 @@ class UserWorkspace:
         return count
 
 
-# ==================== GLOBAL MULTI-TENANT MANAGER ====================
+# ==================== GLOBAL ACCESS & WORKSPACE MANAGER ====================
 class GlobalManager:
     def __init__(self):
-        self.approved_users: Set[int] = set(DB.get("approved_users", [config.OWNER_ID]))
-        self.approved_users.add(config.OWNER_ID)
-        self.banned_users: Set[int] = set(DB.get("banned_users", []))
-        self.open_for_all: bool = DB.get("open_for_all", config.OPEN_FOR_ALL)
+        self.approved_users: Set[int] = {config.OWNER_ID}
+        self.banned_users: Set[int] = set()
+        self.notified_pending: Set[int] = set()
         self.workspaces: Dict[int, UserWorkspace] = {}
 
-    def get_ws(self, user_id: int) -> UserWorkspace:
-        if user_id not in self.workspaces:
-            saved = DB.get("users", {}).get(str(user_id), {})
-            self.workspaces[user_id] = UserWorkspace(user_id, saved)
-        return self.workspaces[user_id]
+    async def load_from_mongo(self):
+        acc_doc = await access_col.find_one({"_id": "global_access"})
+        if acc_doc:
+            self.approved_users = set(acc_doc.get("approved_users", [config.OWNER_ID]))
+            self.approved_users.add(config.OWNER_ID)
+            self.banned_users = set(acc_doc.get("banned_users", []))
+        else:
+            await self.save_access_to_mongo()
 
-    def sync_db(self):
-        DB["approved_users"] = list(self.approved_users)
-        DB["banned_users"] = list(self.banned_users)
-        DB["open_for_all"] = self.open_for_all
-        DB["users"] = {
-            str(uid): ws.to_dict() for uid, ws in self.workspaces.items()
-        }
-        config.save_db(DB)
+        async for u_doc in users_col.find({}):
+            uid = u_doc["user_id"]
+            if uid in self.banned_users:
+                continue
+            ws = UserWorkspace(uid, u_doc)
+            self.workspaces[uid] = ws
+            if ws.recorder_session:
+                print(f"🎙️ Restoring MongoDB Recorder for {uid}...")
+                await ws.set_recorder(ws.recorder_session, save=False)
+            for b_str in list(ws.broadcaster_sessions):
+                print(f"📡 Restoring MongoDB Broadcaster for {uid}...")
+                await ws.add_broadcaster(b_str, save=False)
+
+    async def save_access_to_mongo(self):
+        await access_col.update_one(
+            {"_id": "global_access"},
+            {
+                "$set": {
+                    "approved_users": list(self.approved_users),
+                    "banned_users": list(self.banned_users),
+                }
+            },
+            upsert=True,
+        )
+
+    async def get_ws(self, user_id: int) -> UserWorkspace:
+        if user_id not in self.workspaces:
+            u_doc = await users_col.find_one({"user_id": user_id}) or {}
+            self.workspaces[user_id] = UserWorkspace(user_id, u_doc)
+        return self.workspaces[user_id]
 
 
 MANAGER = GlobalManager()
 
 
-# ==================== ACCESS FILTERS ====================
-def check_access(_, __, update: Message | CallbackQuery) -> bool:
+# ==================== ACCESS GUARD ====================
+def is_authorized(_, __, update: Message | CallbackQuery) -> bool:
     user = update.from_user
     if not user:
         return False
     if user.id in MANAGER.banned_users:
         return False
-    if user.id == config.OWNER_ID or MANAGER.open_for_all:
-        return True
-    return user.id in MANAGER.approved_users
+    return user.id == config.OWNER_ID or user.id in MANAGER.approved_users
 
-access_filter = filters.create(check_access)
+auth_filter = filters.create(is_authorized)
 
 
-# ==================== UI TEMPLATES & KEYBOARDS ====================
+async def handle_unauthorized_user(client: Client, message: Message):
+    user = message.from_user
+    if not user:
+        return
+    if user.id in MANAGER.banned_users:
+        return await message.reply_text("🚫 **You are BANNED from using this bot.**")
+
+    user_tag = f"@{user.username}" if user.username else user.mention
+    restricted_text = (
+        f"⛔  **ACCESS RESTRICTED**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Hello {user_tag},\n\n"
+        f"You need approval to use this bot.\n"
+        f"📩 Request forwarded to admins.\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"You will be notified once approved."
+    )
+    await message.reply_text(restricted_text)
+
+    # Forward interactive approval request to OWNER DM
+    if user.id not in MANAGER.notified_pending:
+        MANAGER.notified_pending.add(user.id)
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Approve Access", callback_data=f"req_app_{user.id}"),
+                InlineKeyboardButton("🚫 Ban User", callback_data=f"req_ban_{user.id}"),
+            ]
+        ])
+        try:
+            await client.send_message(
+                config.OWNER_ID,
+                f"📩 **NEW ACCESS REQUEST**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 **User:** {user.mention} ({user_tag})\n"
+                f"🆔 **User ID:** `{user.id}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Click below to grant or deny access:",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            print(f"[WARN] Could not notify owner: {e}")
+
+
+# ==================== UI TEXTS & ALL SUB-MENU KEYBOARDS ====================
 START_UI = """✨ **Welcome to Audio Forwarder** ✨
 ━━━━━━━━━━━━━━━━━━━━
 👋 **Hello, {mention}!**
@@ -292,918 +365,1022 @@ START_UI = """✨ **Welcome to Audio Forwarder** ✨
 🎵 **Real-time Audio Forwarding**
 📊 **System:** `██████████` 100% ✅
 ⚡ **Features:**
-• Private Per-User Account Login
-• Control 100% inside Bot DM (No Group Needed!)
-• Real-time forwarding & DSP Effects
-• Multi-chat forwarding
+• MongoDB Cloud Account Persistence
+• 100% Button-Controlled Sub-Menus
+• Real-time Forwarding & DSP Effects
+• Multi-chat Forwarding
 • Bass/Treble/Gain/Overdrive/Echo
 ━━━━━━━━━━━━━━━━━━━━
-📱 **Click `My Accounts` below to login your account!**"""
-
-HELP_UI = """📖 **Help Menu (Works in Bot DM!)**
-━━━━━━━━━━━━━━━━━━━━
-📱 **1. Account Setup**
-Use the `📱 My Accounts` button to add your **Recorder** (listener) and **Broadcaster** (speaker) accounts via OTP or Session String. Only YOU can use your accounts!
-━━━━━━━━━━━━━━━━━━━━
-🎵 **2. Audio Controls (Inside Bot DM)**
-/setrecordgroup <id> - Set your Source VC Chat ID
-/record [id] - Start recording from Source VC
-/join <id> - Forward audio to Target VC Chat ID
-/rejoin - Reconnect all your streams
-/leave <id> - Stop forwarding to chat
-/leaveall - Stop all your streams
-/leaverecord - Leave source VC
-/mute - Mute your streams
-/unmute - Unmute your streams
-━━━━━━━━━━━━━━━━━━━━
-🎛️ **3. Effects (no limits!)**
-/level <0-∞> - Volume
-/bass <0-∞> - Bass
-/treble <0-∞> - Treble
-/gain <0-∞> - Gain
-/overdrive <0-∞> - Distortion/Gain
-/echo <delay/decay/off> - Echo
-/effects - Show your active effects
-/reset - Reset your effects
-━━━━━━━━━━━━━━━━━━━━
-📊 **4. Utility**
-/panel - Interactive Control Panel
-/list - Your active forwarding chats
-/status - Your stream & account status
-/id - Get chat ID
-/ping - Check bot latency"""
+👇 **Select a menu below to control everything:**"""
 
 
 def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("📱 My Accounts (Login)", callback_data="usr_accounts"),
-            InlineKeyboardButton("🎛️ Control Panel", callback_data="usr_panel"),
+            InlineKeyboardButton("🎵 Audio Controls", callback_data="menu_audio"),
+            InlineKeyboardButton("🎛️ Audio Effects", callback_data="menu_fx"),
         ],
         [
-            InlineKeyboardButton("👤 Owner", user_id=config.OWNER_ID),
-            InlineKeyboardButton("📖 Help", callback_data="nav_help"),
+            InlineKeyboardButton("📱 My Accounts (DB)", callback_data="menu_acc"),
+            InlineKeyboardButton("📊 Utility & Status", callback_data="menu_util"),
+        ],
+        [
+            InlineKeyboardButton("👤 Owner", url=f"tg://user?id={config.OWNER_ID}"),
+            InlineKeyboardButton("📖 Help Guide", callback_data="menu_help"),
         ],
     ]
     if user_id == config.OWNER_ID:
         rows.append(
-            [InlineKeyboardButton("👑 Owner Admin Panel (Bans & Access)", callback_data="own_main")]
+            [InlineKeyboardButton("👑 Owner Panel (Approve / Ban / DB)", callback_data="menu_owner")]
         )
     return InlineKeyboardMarkup(rows)
 
 
-def user_accounts_kb() -> InlineKeyboardMarkup:
+def audio_menu_kb(ws: UserWorkspace) -> InlineKeyboardMarkup:
+    rec_lbl = "🟢 Recording (Restart)" if ws.recording else "🎙️ Start Recording (/record)"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📱 Login via Phone (OTP/2FA)", callback_data="acc_login_otp"),
+            InlineKeyboardButton(rec_lbl, callback_data="act_record"),
+            InlineKeyboardButton("🎯 Set Source Chat", callback_data="act_setsource"),
         ],
         [
-            InlineKeyboardButton("🎙️ Set Recorder (String)", callback_data="acc_set_rec"),
-            InlineKeyboardButton("➕ Add Broadcaster (String)", callback_data="acc_add_bcast"),
+            InlineKeyboardButton("➕ Join Target VC (/join)", callback_data="act_join"),
+            InlineKeyboardButton("➖ Leave Target VC (/leave)", callback_data="act_leave"),
         ],
         [
-            InlineKeyboardButton("📋 My Connected Accounts", callback_data="acc_list"),
-            InlineKeyboardButton("🗑️ Remove My Account", callback_data="acc_delete"),
+            InlineKeyboardButton("🔇 Mute All (/mute)", callback_data="act_mute"),
+            InlineKeyboardButton("🔊 Unmute All (/unmute)", callback_data="act_unmute"),
         ],
         [
-            InlineKeyboardButton("🏠 Back Home", callback_data="nav_home"),
+            InlineKeyboardButton("🔄 Rejoin All (/rejoin)", callback_data="act_rejoin"),
+            InlineKeyboardButton("⏹️ Leave Source (/leaverecord)", callback_data="act_leaverec"),
+        ],
+        [
+            InlineKeyboardButton("🛑 Disconnect All (/leaveall)", callback_data="act_leaveall"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main"),
         ],
     ])
 
 
-def owner_panel_kb() -> InlineKeyboardMarkup:
-    mode_str = "🟢 Open for All" if MANAGER.open_for_all else "🔒 Approved Only"
+def fx_menu_kb(ws: UserWorkspace) -> InlineKeyboardMarkup:
+    fx = ws.effects
+    echo_lbl = f"{fx['echo'][0]}ms" if fx["echo"] else "Off"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"Mode: {mode_str} (Toggle)", callback_data="own_toggle_mode"),
+            InlineKeyboardButton(f"🔊 Level ({fx['level']})", callback_data="fx_level"),
+            InlineKeyboardButton(f"🎸 Bass ({fx['bass']}dB)", callback_data="fx_bass"),
         ],
         [
-            InlineKeyboardButton("✅ Approve User", callback_data="own_approve"),
+            InlineKeyboardButton(f"🎻 Treble ({fx['treble']}dB)", callback_data="fx_treble"),
+            InlineKeyboardButton(f"⚡ Gain ({fx['gain']}dB)", callback_data="fx_gain"),
+        ],
+        [
+            InlineKeyboardButton(f"🔥 Overdrive ({fx['overdrive']})", callback_data="fx_overdrive"),
+            InlineKeyboardButton(f"🗣️ Echo ({echo_lbl})", callback_data="fx_echo"),
+        ],
+        [
+            InlineKeyboardButton("📋 Show Active Effects", callback_data="fx_show"),
+            InlineKeyboardButton("🔄 Reset All Effects", callback_data="fx_reset"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main"),
+        ],
+    ])
+
+
+def acc_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📱 Login Account via Phone (OTP & 2FA)", callback_data="acc_otp"),
+        ],
+        [
+            InlineKeyboardButton("🎙️ Set Recorder (String)", callback_data="acc_rec_str"),
+            InlineKeyboardButton("➕ Add Broadcaster (String)", callback_data="acc_bcast_str"),
+        ],
+        [
+            InlineKeyboardButton("📋 View My Saved DB Accounts", callback_data="acc_view"),
+            InlineKeyboardButton("🗑️ Delete Account from DB", callback_data="acc_del"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main"),
+        ],
+    ])
+
+
+def util_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏓 Ping Latency", callback_data="util_ping"),
+            InlineKeyboardButton("📊 System & Bot Stats", callback_data="util_stats"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Active Forward List", callback_data="util_list"),
+            InlineKeyboardButton("🆔 My ID & Info", callback_data="util_id"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main"),
+        ],
+    ])
+
+
+def owner_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve User ID", callback_data="own_approve"),
             InlineKeyboardButton("❌ Remove Access", callback_data="own_disapprove"),
         ],
         [
-            InlineKeyboardButton("🚫 Ban User", callback_data="own_ban"),
-            InlineKeyboardButton("🟢 Unban User", callback_data="own_unban"),
+            InlineKeyboardButton("🚫 Ban User ID", callback_data="own_ban"),
+            InlineKeyboardButton("🟢 Unban User ID", callback_data="own_unban"),
         ],
         [
-            InlineKeyboardButton("📋 All Users & Banned List", callback_data="own_list_users"),
+            InlineKeyboardButton("📋 View All Approved, Banned & DB Users", callback_data="own_list"),
         ],
         [
-            InlineKeyboardButton("🏠 Back Home", callback_data="nav_home"),
+            InlineKeyboardButton("🔄 Restart Bot Server", callback_data="own_restart"),
+            InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main"),
         ],
     ])
 
 
-# ==================== START, HELP & MENU HANDLERS ====================
+# ==================== /START & UNAUTHORIZED INTERCEPTOR ====================
 @bot.on_message(filters.command("start"))
 async def start_cmd(client: Client, message: Message):
+    if not is_authorized(None, None, message):
+        return await handle_unauthorized_user(client, message)
+
     uid = message.from_user.id
-    if uid in MANAGER.banned_users:
-        return await message.reply_text("🚫 **You are BANNED from using this bot!**")
-    if not MANAGER.open_for_all and uid not in MANAGER.approved_users:
-        return await message.reply_text(
-            "🔒 **Bot is currently in Private Mode.**\nContact the Owner for access!",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("👤 Contact Owner", user_id=config.OWNER_ID)]]
-            ),
-        )
+    await MANAGER.get_ws(uid)
     await message.reply_text(
         START_UI.format(mention=message.from_user.mention),
         reply_markup=main_menu_kb(uid),
     )
 
 
-@bot.on_message(filters.command("help") & access_filter)
-async def help_cmd(client: Client, message: Message):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="nav_home")]])
-    await message.reply_text(HELP_UI, reply_markup=kb)
-
-
-# ==================== USER SELF-SERVICE ACCOUNT MANAGER ====================
-@bot.on_callback_query(filters.regex(r"^(usr_accounts|acc_)") & access_filter)
-async def user_account_callbacks(client: Client, query: CallbackQuery):
-    uid = query.from_user.id
-    chat_id = query.message.chat.id
-    ws = MANAGER.get_ws(uid)
-    data = query.data
-
-    if data == "usr_accounts":
-        rec_state = "✅ Connected" if ws.recorder_user else "❌ Not Set"
-        text = (
-            f"📱 **Your Private Account Manager**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒 *Only YOU can control the accounts you add here.*\n\n"
-            f"🎙️ **Your Recorder Account:** `{rec_state}`\n"
-            f"📡 **Your Broadcaster Accounts:** `{len(ws.broadcaster_users)} active`\n"
-            f"🎯 **Your Source Chat ID:** `{ws.source_chat or 'Not Set'}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Choose how you want to add or manage your accounts:"
-        )
-        return await query.message.edit_text(text, reply_markup=user_accounts_kb())
-
-    # 1. LOGIN VIA PHONE + OTP + 2FA (SELF-SERVICE)
-    elif data == "acc_login_otp":
-        await query.answer()
-        try:
-            role_msg = await client.ask(
-                chat_id,
-                "📱 **Add Account via Phone & OTP**\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "Reply with:\n"
-                "• `1` — Set as your **Recorder Account** (Joins Source Chat to listen)\n"
-                "• `2` — Add as a **Broadcaster Account** (Joins Target Chat to blast audio)\n\n"
-                "*(Send `/cancel` to abort)*",
-                timeout=60,
-            )
-            if role_msg.text.startswith("/cancel"):
-                return await role_msg.reply_text("🚫 **Login Cancelled!**")
-            role = "recorder" if role_msg.text.strip() == "1" else "broadcaster"
-
-            phone_msg = await client.ask(
-                chat_id,
-                "📞 **Send your Phone Number with country code (e.g. `+919876543210`):**",
-                timeout=120,
-            )
-            if phone_msg.text.startswith("/cancel"):
-                return await phone_msg.reply_text("🚫 **Cancelled!**")
-            phone = phone_msg.text.strip()
-
-            temp_cli = Client(
-                f"tmp_otp_{uid}_{int(time.time())}",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                in_memory=True,
-            )
-            await temp_cli.connect()
-            code_info = await temp_cli.send_code(phone)
-
-            otp_msg = await client.ask(
-                chat_id,
-                "📩 **Send the 5-digit OTP received on Telegram with spaces (e.g., `1 2 3 4 5`):**",
-                timeout=120,
-            )
-            otp_code = otp_msg.text.replace(" ", "").strip()
-
-            try:
-                await temp_cli.sign_in(phone, code_info.phone_code_hash, otp_code)
-            except SessionPasswordNeeded:
-                pwd_msg = await client.ask(
-                    chat_id,
-                    "🔐 **2FA (Two-Step Verification) is enabled on this account.**\n"
-                    "Send your 2FA Password:",
-                    timeout=120,
-                )
-                await temp_cli.check_password(pwd_msg.text.strip())
-
-            session_str = await temp_cli.export_session_string()
-            me = await temp_cli.get_me()
-            await temp_cli.disconnect()
-
-            if role == "recorder":
-                await ws.set_recorder(session_str, save=True)
-                await client.send_message(
-                    chat_id,
-                    f"✅ **Successfully added as your Recorder Account!**\n"
-                    f"👤 **Account:** {me.first_name} (`{me.id}`)",
-                    reply_markup=user_accounts_kb(),
-                )
-            else:
-                await ws.add_broadcaster(session_str, save=True)
-                await client.send_message(
-                    chat_id,
-                    f"✅ **Successfully added to your Broadcasters (#{len(ws.broadcaster_users)})!**\n"
-                    f"👤 **Account:** {me.first_name} (`{me.id}`)",
-                    reply_markup=user_accounts_kb(),
-                )
-        except Exception as e:
-            await client.send_message(chat_id, f"❌ **Login Failed:** `{e}`")
-
-    # 2. SET RECORDER VIA STRING SESSION
-    elif data == "acc_set_rec":
-        await query.answer()
-        try:
-            ask_s = await client.ask(
-                chat_id,
-                "🎙️ **Send your Pyrogram/Pyrofork `STRING_SESSION` for your Recorder Account:**\n"
-                "*(Send `/cancel` to abort)*",
-                timeout=120,
-            )
-            if ask_s.text.startswith("/cancel"):
-                return await ask_s.reply_text("🚫 **Cancelled!**")
-            wait = await ask_s.reply_text("⏳ **Verifying & starting your Recorder Account...**")
-            ok = await ws.set_recorder(ask_s.text.strip(), save=True)
-            if ok:
-                me = await ws.recorder_user.get_me()
-                await wait.edit_text(
-                    f"✅ **Your Recorder Account is Ready!**\n👤 **{me.first_name}** (`{me.id}`)",
-                    reply_markup=user_accounts_kb(),
-                )
-            else:
-                await wait.edit_text("❌ **Invalid String Session!**")
-        except asyncio.TimeoutError:
-            await client.send_message(chat_id, "⏰ **Timed out.**")
-
-    # 3. ADD BROADCASTER VIA STRING SESSION
-    elif data == "acc_add_bcast":
-        await query.answer()
-        try:
-            ask_s = await client.ask(
-                chat_id,
-                "📡 **Send your Pyrogram/Pyrofork `STRING_SESSION` for your Broadcaster Account:**\n"
-                "*(Send `/cancel` to abort)*",
-                timeout=120,
-            )
-            if ask_s.text.startswith("/cancel"):
-                return await ask_s.reply_text("🚫 **Cancelled!**")
-            wait = await ask_s.reply_text("⏳ **Verifying & starting your Broadcaster Account...**")
-            ok = await ws.add_broadcaster(ask_s.text.strip(), save=True)
-            if ok:
-                me = await ws.broadcaster_users[-1].get_me()
-                await wait.edit_text(
-                    f"✅ **Broadcaster Account #{len(ws.broadcaster_users)} Added!**\n"
-                    f"👤 **{me.first_name}** (`{me.id}`)",
-                    reply_markup=user_accounts_kb(),
-                )
-            else:
-                await wait.edit_text("❌ **Invalid String Session!**")
-        except asyncio.TimeoutError:
-            await client.send_message(chat_id, "⏰ **Timed out.**")
-
-    # 4. LIST USER'S PERSONAL ACCOUNTS
-    elif data == "acc_list":
-        await query.answer()
-        rec_txt = "❌ Not Set"
-        if ws.recorder_user:
-            try:
-                rme = await ws.recorder_user.get_me()
-                rec_txt = f"✅ {rme.first_name} (`{rme.id}`)"
-            except Exception:
-                rec_txt = "⚠️ Disconnected"
-
-        b_lines = []
-        for i, u in enumerate(ws.broadcaster_users):
-            try:
-                bme = await u.get_me()
-                b_lines.append(f"  `{i+1}.` {bme.first_name} (`{bme.id}`)")
-            except Exception:
-                b_lines.append(f"  `{i+1}.` Disconnected")
-        b_txt = "\n".join(b_lines) if b_lines else "  ❌ None Added"
-
-        await query.message.edit_text(
-            f"📋 **Your Personal Connected Accounts**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎙️ **Recorder:** {rec_txt}\n\n"
-            f"📡 **Broadcasters ({len(ws.broadcaster_users)}):**\n{b_txt}\n"
-            f"━━━━━━━━━━━━━━━━━━━━",
-            reply_markup=user_accounts_kb(),
-        )
-
-    # 5. DELETE USER'S OWN ACCOUNT
-    elif data == "acc_delete":
-        await query.answer()
-        ask_del = await client.ask(
-            chat_id,
-            "🗑️ **Remove Your Account**\n"
-            "• Send `0` to remove your **Recorder Account**\n"
-            "• Or send the **Broadcaster Number** (`1`, `2`, ...) to remove that Broadcaster\n"
-            "*(Send `/cancel` to abort)*",
-            timeout=60,
-        )
-        if ask_del.text.startswith("/cancel"):
-            return await ask_del.reply_text("🚫 **Cancelled!**")
-        try:
-            choice = int(ask_del.text.strip())
-            if choice == 0:
-                if ws.recorder_user:
-                    await ws.recorder_user.stop()
-                ws.recorder_user = None
-                ws.recorder_call = None
-                ws.recorder_session = ""
-                MANAGER.sync_db()
-                await ask_del.reply_text("✅ **Your Recorder Account was removed!**")
-            else:
-                idx = choice - 1
-                u_cli = ws.broadcaster_users.pop(idx)
-                ws.broadcaster_calls.pop(idx)
-                ws.broadcaster_sessions.pop(idx)
-                MANAGER.sync_db()
-                await u_cli.stop()
-                await ask_del.reply_text(f"✅ **Removed your Broadcaster Account #{choice}!**")
-        except Exception as e:
-            await ask_del.reply_text(f"❌ **Invalid selection:** `{e}`")
-
-
-# ==================== OWNER ADMIN PANEL (BAN / UNBAN / ACCESS) ====================
-@bot.on_message(filters.command("owner") & filters.user(config.OWNER_ID))
-async def owner_cmd(client: Client, message: Message):
-    await message.reply_text(
-        "👑 **Master Owner Panel**\nManage user access, bans, and global mode:",
-        reply_markup=owner_panel_kb(),
-    )
-
-
-@bot.on_callback_query(filters.regex(r"^own_"))
-async def owner_callbacks(client: Client, query: CallbackQuery):
+# ==================== INSTANT OWNER APPROVAL / BAN BUTTONS ====================
+@bot.on_callback_query(filters.regex(r"^req_(app|ban)_(\d+)$"))
+async def handle_access_request_buttons(client: Client, query: CallbackQuery):
     if query.from_user.id != config.OWNER_ID:
-        return await query.answer("❌ Only the Bot Owner can use this button!", show_alert=True)
+        return await query.answer("❌ Only the Bot Owner can do this!", show_alert=True)
 
-    data = query.data
-    chat_id = query.message.chat.id
+    action, target_str = query.data.split("_")[1], query.data.split("_")[2]
+    target_uid = int(target_str)
 
-    if data == "own_main":
-        return await query.message.edit_text(
-            f"👑 **Master Owner Panel**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🌐 **Public Mode:** `{'ON' if MANAGER.open_for_all else 'OFF (Approved Only)'}`\n"
-            f"✅ **Approved Users:** `{len(MANAGER.approved_users)}`\n"
-            f"🚫 **Banned Users:** `{len(MANAGER.banned_users)}`\n"
-            f"👥 **Active Workspaces:** `{len(MANAGER.workspaces)}`",
-            reply_markup=owner_panel_kb(),
-        )
+    if action == "app":
+        MANAGER.banned_users.discard(target_uid)
+        MANAGER.approved_users.add(target_uid)
+        MANAGER.notified_pending.discard(target_uid)
+        await MANAGER.save_access_to_mongo()
 
-    elif data == "own_toggle_mode":
-        MANAGER.open_for_all = not MANAGER.open_for_all
-        MANAGER.sync_db()
-        await query.answer("Updated Bot Access Mode!")
-        return await owner_callbacks(client, query)
-
-    elif data in ("own_approve", "own_disapprove", "own_ban", "own_unban"):
-        await query.answer()
-        titles = {
-            "own_approve": "✅ **Send User ID to APPROVE:**",
-            "own_disapprove": "❌ **Send User ID to REMOVE ACCESS (and stop their streams):**",
-            "own_ban": "🚫 **Send User ID to BAN (stops streams & blocks bot):**",
-            "own_unban": "🟢 **Send User ID to UNBAN:**",
-        }
-        try:
-            msg = await client.ask(chat_id, titles[data] + "\n*(Or `/cancel`)*", timeout=60)
-            if msg.text.startswith("/cancel"):
-                return await msg.reply_text("🚫 **Cancelled!**")
-            t_uid = int(msg.text.strip())
-            if t_uid == config.OWNER_ID:
-                return await msg.reply_text("❌ **Cannot modify Owner ID!**")
-
-            if data == "own_approve":
-                MANAGER.banned_users.discard(t_uid)
-                MANAGER.approved_users.add(t_uid)
-                res = f"✅ **Approved `{t_uid}`!**"
-            elif data == "own_disapprove":
-                MANAGER.approved_users.discard(t_uid)
-                if t_uid in MANAGER.workspaces:
-                    await MANAGER.workspaces[t_uid].leave_all()
-                res = f"❌ **Removed access for `{t_uid}`!**"
-            elif data == "own_ban":
-                MANAGER.approved_users.discard(t_uid)
-                MANAGER.banned_users.add(t_uid)
-                if t_uid in MANAGER.workspaces:
-                    await MANAGER.workspaces[t_uid].leave_all()
-                res = f"🚫 **Banned `{t_uid}` and disconnected all their streams!**"
-            else:
-                MANAGER.banned_users.discard(t_uid)
-                res = f"🟢 **Unbanned `{t_uid}`!**"
-
-            MANAGER.sync_db()
-            await msg.reply_text(res, reply_markup=owner_panel_kb())
-        except Exception as e:
-            await client.send_message(chat_id, f"❌ **Error:** `{e}`")
-
-    elif data == "own_list_users":
-        await query.answer()
-        app_str = ", ".join([f"`{u}`" for u in MANAGER.approved_users]) or "None"
-        ban_str = ", ".join([f"`{u}`" for u in MANAGER.banned_users]) or "None"
-        ws_lines = [
-            f"• `{uid}`: Rec={'✅' if ws.recorder_user else '❌'} | Bcast={len(ws.broadcaster_users)}"
-            for uid, ws in MANAGER.workspaces.items()
-        ]
-        ws_str = "\n".join(ws_lines) or "None"
         await query.message.edit_text(
-            f"📋 **Global Users & Workspaces**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👥 **Users with Accounts:**\n{ws_str}\n\n"
-            f"✅ **Approved:** {app_str}\n"
-            f"🚫 **Banned:** {ban_str}",
-            reply_markup=owner_panel_kb(),
+            f"{query.message.text}\n\n✅ **STATUS: APPROVED BY OWNER**"
         )
+        try:
+            await client.send_message(
+                target_uid,
+                "🎉 **ACCESS APPROVED!**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ An admin has approved your request!\n"
+                "You now have full access to the bot and all menus below:",
+                reply_markup=main_menu_kb(target_uid),
+            )
+        except Exception:
+            pass
+    else:
+        MANAGER.approved_users.discard(target_uid)
+        MANAGER.banned_users.add(target_uid)
+        MANAGER.notified_pending.discard(target_uid)
+        await MANAGER.save_access_to_mongo()
+
+        await query.message.edit_text(
+            f"{query.message.text}\n\n🚫 **STATUS: BANNED BY OWNER**"
+        )
+        try:
+            await client.send_message(
+                target_uid,
+                "🚫 **Your access request was denied and your ID has been banned.**",
+            )
+        except Exception:
+            pass
 
 
-# ==================== NAVIGATION & USER CONTROL PANEL ====================
-@bot.on_callback_query(filters.regex(r"^(nav_|usr_panel|ctl_)") & access_filter)
-async def nav_callbacks(client: Client, query: CallbackQuery):
+# ==================== SUB-MENU NAVIGATION CALLBACKS ====================
+@bot.on_callback_query(filters.regex(r"^menu_"))
+async def sub_menu_router(client: Client, query: CallbackQuery):
+    if not is_authorized(None, None, query):
+        return await query.answer("⛔ Access Restricted! Wait for admin approval.", show_alert=True)
+
     uid = query.from_user.id
-    ws = MANAGER.get_ws(uid)
-    data = query.data
+    ws = await MANAGER.get_ws(uid)
+    menu = query.data
 
-    if data == "nav_home":
-        return await query.message.edit_text(
+    if menu == "menu_main":
+        await query.message.edit_text(
             START_UI.format(mention=query.from_user.mention),
             reply_markup=main_menu_kb(uid),
         )
-    elif data == "nav_help":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="nav_home")]])
-        return await query.message.edit_text(HELP_UI, reply_markup=kb)
-
-    elif data == "usr_panel":
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔇 Mute", callback_data="ctl_mute"),
-                InlineKeyboardButton("🔊 Unmute", callback_data="ctl_unmute"),
-            ],
-            [
-                InlineKeyboardButton("🔄 Reset FX", callback_data="ctl_reset"),
-                InlineKeyboardButton("🛑 Leave All", callback_data="ctl_leaveall"),
-            ],
-            [
-                InlineKeyboardButton("📱 My Accounts", callback_data="usr_accounts"),
-                InlineKeyboardButton("🏠 Home", callback_data="nav_home"),
-            ],
-        ])
+    elif menu == "menu_audio":
         status = "🟢 Live" if ws.recording else "🔴 Stopped"
-        return await query.message.edit_text(
-            f"🎛️ **Your Personal Control Panel**\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📡 **Your Source Chat:** `{ws.source_chat or 'Not Set (/setrecordgroup)'}`\n"
-            f"🔗 **Your Active Targets:** `{len(ws.targets)}/{len(ws.broadcaster_users)}`\n"
-            f"📊 **Status:** {status}",
-            reply_markup=kb,
-        )
-
-    elif data == "ctl_mute":
-        ws.muted = True
-        for t_id, b_idx in ws.targets.items():
-            await ws.broadcaster_calls[b_idx].mute_stream(t_id)
-        await query.answer("🔇 Your streams are now Muted!")
-    elif data == "ctl_unmute":
-        ws.muted = False
-        for t_id, b_idx in ws.targets.items():
-            await ws.broadcaster_calls[b_idx].unmute_stream(t_id)
-        await query.answer("🔊 Your streams are now Unmuted!")
-    elif data == "ctl_reset":
-        for k in ws.effects:
-            ws.effects[k] = 1.0 if k == "level" else (None if k == "echo" else 0.0)
-        await ws.reload_streams()
-        await query.answer("🔄 Your effects have been reset!")
-    elif data == "ctl_leaveall":
-        await ws.leave_all()
         await query.message.edit_text(
-            "🛑 **All your chats disconnected successfully!**",
-            reply_markup=main_menu_kb(uid),
+            f"🎵 **Audio Controls Sub-Menu**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 **Source Chat ID:** `{ws.source_chat or 'Not Set'}`\n"
+            f"🔗 **Active Targets:** `{len(ws.targets)}/{len(ws.broadcaster_users)}`\n"
+            f"🔇 **Muted:** `{ws.muted}` | 📊 **Status:** {status}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Click any button below to execute:",
+            reply_markup=audio_menu_kb(ws),
+        )
+    elif menu == "menu_fx":
+        await query.message.edit_text(
+            "🎛️ **DSP Audio Effects Sub-Menu (No Limits!)**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Click any effect below to adjust its value in real time:",
+            reply_markup=fx_menu_kb(ws),
+        )
+    elif menu == "menu_acc":
+        rec_s = "✅ Saved in DB" if ws.recorder_user else "❌ Not Set"
+        await query.message.edit_text(
+            f"📱 **My Accounts (MongoDB Saved)**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔒 *Your accounts are saved permanently in MongoDB and isolated to your ID.*\n\n"
+            f"🎙️ **Recorder Account:** `{rec_s}`\n"
+            f"📡 **Broadcaster Accounts:** `{len(ws.broadcaster_users)} active`\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=acc_menu_kb(),
+        )
+    elif menu == "menu_util":
+        await query.message.edit_text(
+            "📊 **Utility & System Status Sub-Menu**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Select a utility command below:",
+            reply_markup=util_menu_kb(),
+        )
+    elif menu == "menu_help":
+        await query.message.edit_text(
+            "📖 **Complete Command & Button Guide**\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Every feature works both via **Buttons** and **Commands**:\n\n"
+            "🎵 **Audio:** `/record`, `/setrecordgroup <id>`, `/join <id>`, `/leave <id>`, `/rejoin`, `/leaverecord`, `/mute`, `/unmute`, `/leaveall`\n\n"
+            "🎛️ **Effects:** `/level`, `/bass`, `/treble`, `/gain`, `/overdrive`, `/echo`, `/effects`, `/reset`\n\n"
+            "📊 **Utility:** `/ping`, `/stats`, `/status`, `/list`, `/id`, `/panel`\n\n"
+            "👑 **Owner:** `/owner`, `/approve <id>`, `/disapprove <id>`, `/ban <id>`, `/unban <id>`, `/userlist`, `/restart`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back Home", callback_data="menu_main")]]),
+        )
+    elif menu == "menu_owner":
+        if uid != config.OWNER_ID:
+            return await query.answer("❌ Owner Only!", show_alert=True)
+        await query.message.edit_text(
+            f"👑 **Master Owner Control Panel (MongoDB)**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ **Approved Users:** `{len(MANAGER.approved_users)}`\n"
+            f"🚫 **Banned Users:** `{len(MANAGER.banned_users)}`\n"
+            f"👥 **Loaded User Workspaces:** `{len(MANAGER.workspaces)}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=owner_menu_kb(),
         )
 
 
-# ==================== DM-READY AUDIO COMMANDS (PER-USER) ====================
-@bot.on_message(filters.command("setrecordgroup") & access_filter)
-async def setrecordgroup_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "❌ **Usage:** `/setrecordgroup <source_chat_id>`\n"
-            "Example: `/setrecordgroup -1004426372558`"
-        )
-    try:
-        ws.source_chat = int(message.command[1])
-        MANAGER.sync_db()
-        await message.reply_text(
-            f"✅ **Your Source Recording Chat is set to:** `{ws.source_chat}`\n"
-            f"Now you can simply type `/record` right here in DM!"
-        )
-    except ValueError:
-        await message.reply_text("❌ **Invalid Chat ID!**")
+# ==================== AUDIO CONTROLS SUB-MENU ACTIONS ====================
+@bot.on_callback_query(filters.regex(r"^act_"))
+async def audio_actions_callbacks(client: Client, query: CallbackQuery):
+    if not is_authorized(None, None, query):
+        return await query.answer("⛔ Access Restricted!", show_alert=True)
 
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
+    ws = await MANAGER.get_ws(uid)
+    act = query.data
 
-@bot.on_message(filters.command("record") & access_filter)
-async def record_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if not ws.recorder_call:
-        return await message.reply_text(
-            "❌ **You haven't added your Recorder Account yet!**\n"
-            "Click `/start` -> `📱 My Accounts` to login your account.",
-            reply_markup=user_accounts_kb(),
-        )
-
-    # Allow /record <chat_id> directly in DM, or fallback to saved source_chat
-    if len(message.command) > 1:
+    if act == "act_setsource":
+        await query.answer()
         try:
-            ws.source_chat = int(message.command[1])
-            MANAGER.sync_db()
-        except ValueError:
-            return await message.reply_text("❌ **Invalid Source Chat ID!**")
-    elif not ws.source_chat:
-        if message.chat.type.name != "PRIVATE":
-            ws.source_chat = message.chat.id
-            MANAGER.sync_db()
-        else:
-            return await message.reply_text(
-                "❌ **Specify a Source Chat ID to record from in DM!**\n"
-                "**Usage:** `/record -1004426372558` or `/setrecordgroup -1004426372558`"
+            ans = await client.ask(
+                chat_id,
+                "🎯 **Send the Source Group Chat ID (e.g. `-1004426372558`) where your Recorder Account will listen:**\n"
+                "*(Or send `/cancel`)*",
+                timeout=60,
             )
-
-    try:
-        await ws.start_bridge()
-        await ws.recorder_call.record(
-            ws.source_chat,
-            RecordStream(
-                ws.fifo_path,
-                AudioParameters(bitrate=48000, channels=2),
-            ),
-        )
-        ws.recording = True
-    except Exception as e:
-        return await message.reply_text(
-            f"❌ **Could not record from `{ws.source_chat}`:**\n`{e}`\n\n"
-            f"💡 *Make sure your Recorder Account is inside that group and the Voice Chat is active!*"
-        )
-
-    text = (
-        f"✅ **Recording started successfully!**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 **Source:** `{ws.source_chat}`\n"
-        f"🔗 **Forwarding:** {len(ws.targets)} chats\n"
-        f"📊 **Status:** 🟢 Live\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎵 **Audio is now flowing!**"
-    )
-    await message.reply_text(text)
-
-
-@bot.on_message(filters.command("join") & access_filter)
-async def join_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if len(message.command) < 2:
-        return await message.reply_text("❌ **Usage:** `/join <target_chat_id>`")
-
-    try:
-        target_id = int(message.command[1])
-    except ValueError:
-        return await message.reply_text("❌ **Invalid Chat ID!**")
-
-    if target_id in ws.targets:
-        b_idx = ws.targets[target_id]
-    else:
-        b_idx = ws.get_free_broadcaster()
-        if b_idx is None:
-            return await message.reply_text(
-                "❌ **You have no free Broadcaster Accounts left!**\n"
-                "Open `/start` -> `📱 My Accounts` to login another Broadcaster account.",
-                reply_markup=user_accounts_kb(),
+            if ans.text.startswith("/cancel"):
+                return await ans.reply_text("🚫 **Cancelled!**", reply_markup=audio_menu_kb(ws))
+            ws.source_chat = int(ans.text.strip())
+            await ws.save_to_mongo()
+            await ans.reply_text(
+                f"✅ **Source Chat saved to MongoDB:** `{ws.source_chat}`",
+                reply_markup=audio_menu_kb(ws),
             )
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ **Invalid Chat ID:** `{e}`", reply_markup=audio_menu_kb(ws))
 
-    try:
-        await ws.broadcaster_calls[b_idx].play(target_id, ws.get_target_stream())
-        ws.targets[target_id] = b_idx
-    except Exception as e:
-        return await message.reply_text(
-            f"❌ **Failed to join target VC `{target_id}`:**\n`{e}`\n\n"
-            f"💡 *Make sure your Broadcaster Account #{b_idx+1} is in that group and VC is open!*"
-        )
-
-    text = (
-        f"✅ **Forwarding started successfully!**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 **Target:** `{target_id}`\n"
-        f"🔗 **Total connections:** {len(ws.targets)}\n"
-        f"📊 **Status:** 🟢 Connected\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🎵 **Audio is now flowing to this chat!**"
-    )
-    await message.reply_text(text)
-
-
-@bot.on_message(filters.command("leaveall") & access_filter)
-async def leaveall_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    total_left = await ws.leave_all()
-    text = (
-        f"✅ **All chats disconnected successfully!**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 **Source:** ✅ Left\n"
-        f"🔗 **Forwarding:** {total_left}/{total_left} left\n"
-        f"📊 **Status:** 🔴 All disconnected\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    await message.reply_text(text)
-
-
-@bot.on_message(filters.command("leave") & access_filter)
-async def leave_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if len(message.command) < 2:
-        return await message.reply_text("❌ **Usage:** `/leave <target_chat_id>`")
-    try:
-        target_id = int(message.command[1])
-    except ValueError:
-        return await message.reply_text("❌ **Invalid Chat ID!**")
-
-    if target_id not in ws.targets:
-        return await message.reply_text("❌ **You are not forwarding to that chat!**")
-
-    b_idx = ws.targets.pop(target_id)
-    try:
-        await ws.broadcaster_calls[b_idx].leave_call(target_id)
-    except Exception:
-        pass
-    await message.reply_text(f"✅ **Stopped forwarding to `{target_id}`!**")
-
-
-@bot.on_message(filters.command("leaverecord") & access_filter)
-async def leaverecord_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if ws.source_chat and ws.recorder_call:
-        try:
-            await ws.recorder_call.leave_call(ws.source_chat)
-        except Exception:
-            pass
-    await ws.stop_bridge()
-    ws.recording = False
-    await message.reply_text("✅ **Your Recorder Account left the Source VC!**")
-
-
-@bot.on_message(filters.command("rejoin") & access_filter)
-async def rejoin_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if ws.source_chat and ws.recording and ws.recorder_call:
+    elif act == "act_record":
+        if not ws.recorder_call:
+            return await query.answer("❌ Add a Recorder Account in '📱 My Accounts' first!", show_alert=True)
+        if not ws.source_chat:
+            return await query.answer("❌ Click '🎯 Set Source Chat' first!", show_alert=True)
+        await query.answer("🎙️ Starting recording...")
         try:
             await ws.start_bridge()
             await ws.recorder_call.record(
                 ws.source_chat,
                 RecordStream(ws.fifo_path, AudioParameters(bitrate=48000, channels=2)),
             )
-        except Exception:
-            pass
-    await ws.reload_streams()
-    await message.reply_text("🔄 **Reconnected all your active streams!**")
+            ws.recording = True
+            await query.message.edit_text(
+                f"✅ **Recording started successfully!**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📡 **Source:** `{ws.source_chat}`\n"
+                f"🔗 **Forwarding:** {len(ws.targets)} chats\n"
+                f"📊 **Status:** 🟢 Live\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🎵 **Audio is now flowing!**",
+                reply_markup=audio_menu_kb(ws),
+            )
+        except Exception as e:
+            await query.message.edit_text(f"❌ **Record Error:** `{e}`", reply_markup=audio_menu_kb(ws))
 
-
-@bot.on_message(filters.command("mute") & access_filter)
-async def mute_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    ws.muted = True
-    for t_id, b_idx in ws.targets.items():
+    elif act == "act_join":
+        await query.answer()
         try:
-            await ws.broadcaster_calls[b_idx].mute_stream(t_id)
-        except Exception:
-            pass
-    await message.reply_text("🔇 **Your target streams are now Muted!**")
+            ans = await client.ask(
+                chat_id,
+                "➕ **Send the Target Group Chat ID to forward audio into (e.g. `-1003665014605`):**\n"
+                "*(Or send `/cancel`)*",
+                timeout=60,
+            )
+            if ans.text.startswith("/cancel"):
+                return await ans.reply_text("🚫 **Cancelled!**", reply_markup=audio_menu_kb(ws))
+            t_id = int(ans.text.strip())
+
+            b_idx = ws.targets.get(t_id, ws.get_free_broadcaster())
+            if b_idx is None:
+                return await ans.reply_text(
+                    "❌ **No free Broadcaster Account available! Add one in `📱 My Accounts`.**",
+                    reply_markup=acc_menu_kb(),
+                )
+            await ws.broadcaster_calls[b_idx].play(t_id, ws.get_target_stream())
+            ws.targets[t_id] = b_idx
+            await ans.reply_text(
+                f"✅ **Forwarding started successfully!**\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 **Target:** `{t_id}`\n"
+                f"🔗 **Total connections:** {len(ws.targets)}\n"
+                f"📊 **Status:** 🟢 Connected\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🎵 **Audio is now flowing to this chat!**",
+                reply_markup=audio_menu_kb(ws),
+            )
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ **Join Failed:** `{e}`", reply_markup=audio_menu_kb(ws))
+
+    elif act == "act_leave":
+        if not ws.targets:
+            return await query.answer("📭 No active target chats to leave!", show_alert=True)
+        await query.answer()
+        t_list = "\n".join([f"• `{tid}`" for tid in ws.targets])
+        ans = await client.ask(
+            chat_id,
+            f"➖ **Send Target Chat ID to disconnect:**\n{t_list}\n*(Or `/cancel`)*",
+            timeout=60,
+        )
+        if not ans.text.startswith("/cancel"):
+            try:
+                tid = int(ans.text.strip())
+                if tid in ws.targets:
+                    b_idx = ws.targets.pop(tid)
+                    await ws.broadcaster_calls[b_idx].leave_call(tid)
+                    await ans.reply_text(f"✅ **Left `{tid}`!**", reply_markup=audio_menu_kb(ws))
+            except Exception as e:
+                await ans.reply_text(f"❌ **Error:** `{e}`", reply_markup=audio_menu_kb(ws))
+
+    elif act == "act_mute":
+        ws.muted = True
+        for tid, idx in ws.targets.items():
+            try:
+                await ws.broadcaster_calls[idx].mute_stream(tid)
+            except Exception:
+                pass
+        await query.answer("🔇 All your streams are now Muted!", show_alert=True)
+        await sub_menu_router(client, query)
+
+    elif act == "act_unmute":
+        ws.muted = False
+        for tid, idx in ws.targets.items():
+            try:
+                await ws.broadcaster_calls[idx].unmute_stream(tid)
+            except Exception:
+                pass
+        await query.answer("🔊 All your streams are now Unmuted!", show_alert=True)
+
+    elif act == "act_rejoin":
+        if ws.source_chat and ws.recording and ws.recorder_call:
+            try:
+                await ws.start_bridge()
+                await ws.recorder_call.record(
+                    ws.source_chat,
+                    RecordStream(ws.fifo_path, AudioParameters(bitrate=48000, channels=2)),
+                )
+            except Exception:
+                pass
+        await ws.reload_streams()
+        await query.answer("🔄 Reconnected all active streams!", show_alert=True)
+
+    elif act == "act_leaverec":
+        if ws.source_chat and ws.recorder_call:
+            try:
+                await ws.recorder_call.leave_call(ws.source_chat)
+            except Exception:
+                pass
+        await ws.stop_bridge()
+        ws.recording = False
+        await query.answer("⏹️ Left Source Recording VC!", show_alert=True)
+        await query.message.edit_text("⏹️ **Recorder left the Source VC.**", reply_markup=audio_menu_kb(ws))
+
+    elif act == "act_leaveall":
+        left_cnt = await ws.leave_all()
+        await query.message.edit_text(
+            f"✅ **All chats disconnected successfully!**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 **Source:** ✅ Left\n"
+            f"🔗 **Forwarding:** {left_cnt}/{left_cnt} left\n"
+            f"📊 **Status:** 🔴 All disconnected\n"
+            f"━━━━━━━━━━━━━━━━━━━━",
+            reply_markup=audio_menu_kb(ws),
+        )
 
 
-@bot.on_message(filters.command("unmute") & access_filter)
-async def unmute_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    ws.muted = False
-    for t_id, b_idx in ws.targets.items():
+# ==================== DSP EFFECTS SUB-MENU ACTIONS ====================
+@bot.on_callback_query(filters.regex(r"^fx_"))
+async def fx_actions_callbacks(client: Client, query: CallbackQuery):
+    if not is_authorized(None, None, query):
+        return await query.answer("⛔ Access Restricted!", show_alert=True)
+
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
+    ws = await MANAGER.get_ws(uid)
+    cmd = query.data.replace("fx_", "")
+
+    if cmd == "show":
+        fx = ws.effects
+        echo_str = f"{fx['echo'][0]}ms / {fx['echo'][1]}" if fx["echo"] else "Off"
+        return await query.message.edit_text(
+            f"🎛️ **Your Active Audio Effects**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔊 **Level:** `{fx['level']}`\n"
+            f"🎸 **Bass:** `{fx['bass']} dB`\n"
+            f"🎻 **Treble:** `{fx['treble']} dB`\n"
+            f"⚡ **Gain:** `{fx['gain']} dB`\n"
+            f"🔥 **Overdrive:** `{fx['overdrive']}`\n"
+            f"🗣️ **Echo:** `{echo_str}`",
+            reply_markup=fx_menu_kb(ws),
+        )
+
+    elif cmd == "reset":
+        ws.effects = {
+            "level": 1.0, "bass": 0.0, "treble": 0.0,
+            "gain": 0.0, "overdrive": 0.0, "echo": None,
+        }
+        await ws.save_to_mongo()
+        await ws.reload_streams()
+        await query.answer("🔄 All effects reset to default!", show_alert=True)
+        return await query.message.edit_text(
+            "✅ **All audio effects have been reset!**", reply_markup=fx_menu_kb(ws)
+        )
+
+    elif cmd == "echo":
+        await query.answer()
+        ans = await client.ask(
+            chat_id,
+            "🗣️ **Send Echo value as `<delay_ms>/<decay>` (e.g. `500/0.6`) or `off`:**",
+            timeout=60,
+        )
+        val_str = ans.text.strip().lower()
+        if val_str == "off":
+            ws.effects["echo"] = None
+        else:
+            try:
+                p = val_str.split("/")
+                ws.effects["echo"] = (int(p[0]), min(max(float(p[1]), 0.1), 0.99))
+            except Exception:
+                return await ans.reply_text("❌ **Invalid format!**", reply_markup=fx_menu_kb(ws))
+        await ws.save_to_mongo()
+        await ws.reload_streams()
+        return await ans.reply_text("✅ **Echo Effect Updated!**", reply_markup=fx_menu_kb(ws))
+
+    elif cmd in ("level", "bass", "treble", "gain", "overdrive"):
+        await query.answer()
+        ans = await client.ask(
+            chat_id,
+            f"🎚️ **Send new numeric value for `{cmd.upper()}` (0 - ∞):**",
+            timeout=60,
+        )
         try:
-            await ws.broadcaster_calls[b_idx].unmute_stream(t_id)
-        except Exception:
-            pass
-    await message.reply_text("🔊 **Your target streams are now Unmuted!**")
+            val = float(ans.text.strip())
+            ws.effects[cmd] = val
+            await ws.save_to_mongo()
+            await ws.reload_streams()
+            await ans.reply_text(
+                f"✅ **{cmd.capitalize()} updated to `{val}` & saved to MongoDB!**",
+                reply_markup=fx_menu_kb(ws),
+            )
+        except ValueError:
+            await ans.reply_text("❌ **Invalid number!**", reply_markup=fx_menu_kb(ws))
 
 
-# ==================== PER-USER DSP EFFECTS ====================
+# ==================== MY ACCOUNTS (MONGODB) SUB-MENU ACTIONS ====================
+@bot.on_callback_query(filters.regex(r"^acc_"))
+async def acc_actions_callbacks(client: Client, query: CallbackQuery):
+    if not is_authorized(None, None, query):
+        return await query.answer("⛔ Access Restricted!", show_alert=True)
+
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
+    ws = await MANAGER.get_ws(uid)
+    act = query.data
+
+    if act == "acc_otp":
+        await query.answer()
+        try:
+            role_q = await client.ask(
+                chat_id,
+                "📱 **Add Account to MongoDB via Phone (OTP/2FA)**\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Reply `1` for **Recorder Account** (Source Listener)\n"
+                "Reply `2` for **Broadcaster Account** (Target Speaker)\n"
+                "*(Or `/cancel`)*",
+                timeout=60,
+            )
+            if role_q.text.startswith("/cancel"):
+                return await role_q.reply_text("🚫 **Cancelled!**", reply_markup=acc_menu_kb())
+            role = "rec" if role_q.text.strip() == "1" else "bcast"
+
+            phone_q = await client.ask(
+                chat_id, "📞 **Send Phone Number with country code (e.g. `+919876543210`):**", timeout=120
+            )
+            phone = phone_q.text.strip()
+
+            tmp = Client(
+                f"otp_{uid}_{int(time.time())}",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                in_memory=True,
+            )
+            await tmp.connect()
+            sent = await tmp.send_code(phone)
+
+            otp_q = await client.ask(
+                chat_id, "📩 **Enter the 5-digit Telegram OTP with spaces (e.g. `1 2 3 4 5`):**", timeout=120
+            )
+            otp = otp_q.text.replace(" ", "").strip()
+
+            try:
+                await tmp.sign_in(phone, sent.phone_code_hash, otp)
+            except SessionPasswordNeeded:
+                pwd_q = await client.ask(chat_id, "🔐 **Send your 2FA Password:**", timeout=120)
+                await tmp.check_password(pwd_q.text.strip())
+
+            s_str = await tmp.export_session_string()
+            me = await tmp.get_me()
+            await tmp.disconnect()
+
+            if role == "rec":
+                await ws.set_recorder(s_str, save=True)
+                await client.send_message(
+                    chat_id,
+                    f"✅ **Recorder Account Saved to MongoDB!**\n👤 **{me.first_name}** (`{me.id}`)",
+                    reply_markup=acc_menu_kb(),
+                )
+            else:
+                await ws.add_broadcaster(s_str, save=True)
+                await client.send_message(
+                    chat_id,
+                    f"✅ **Broadcaster #{len(ws.broadcaster_users)} Saved to MongoDB!**\n👤 **{me.first_name}** (`{me.id}`)",
+                    reply_markup=acc_menu_kb(),
+                )
+        except Exception as e:
+            await client.send_message(chat_id, f"❌ **OTP Login Failed:** `{e}`", reply_markup=acc_menu_kb())
+
+    elif act in ("acc_rec_str", "acc_bcast_str"):
+        await query.answer()
+        label = "Recorder" if act == "acc_rec_str" else "Broadcaster"
+        ans = await client.ask(
+            chat_id, f"🔑 **Send Pyrogram/Pyrofork `STRING_SESSION` for your {label} Account:**", timeout=120
+        )
+        if ans.text.startswith("/cancel"):
+            return await ans.reply_text("🚫 **Cancelled!**", reply_markup=acc_menu_kb())
+        wait = await ans.reply_text("⏳ **Connecting & saving to MongoDB...**")
+        ok = (
+            await ws.set_recorder(ans.text.strip(), save=True)
+            if act == "acc_rec_str"
+            else await ws.add_broadcaster(ans.text.strip(), save=True)
+        )
+        if ok:
+            await wait.edit_text(f"✅ **{label} Account Connected & Saved in MongoDB!**", reply_markup=acc_menu_kb())
+        else:
+            await wait.edit_text("❌ **Invalid Session String!**", reply_markup=acc_menu_kb())
+
+    elif act == "acc_view":
+        rec_info = "❌ None"
+        if ws.recorder_user:
+            try:
+                rme = await ws.recorder_user.get_me()
+                rec_info = f"✅ {rme.first_name} (`{rme.id}`)"
+            except Exception:
+                rec_info = "⚠️ Error"
+        b_list = []
+        for idx, u in enumerate(ws.broadcaster_users):
+            try:
+                bme = await u.get_me()
+                b_list.append(f"  `{idx+1}.` {bme.first_name} (`{bme.id}`)")
+            except Exception:
+                b_list.append(f"  `{idx+1}.` Disconnected")
+        b_str = "\n".join(b_list) or "  ❌ None"
+        await query.message.edit_text(
+            f"📋 **Your MongoDB Saved Accounts**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎙️ **Recorder:** {rec_info}\n\n"
+            f"📡 **Broadcasters ({len(ws.broadcaster_users)}):**\n{b_str}",
+            reply_markup=acc_menu_kb(),
+        )
+
+    elif act == "acc_del":
+        await query.answer()
+        ans = await client.ask(
+            chat_id,
+            "🗑️ **Send `0` to delete your Recorder Account, or `1, 2...` to delete a Broadcaster Account:**",
+            timeout=60,
+        )
+        try:
+            num = int(ans.text.strip())
+            if num == 0:
+                if ws.recorder_user:
+                    await ws.recorder_user.stop()
+                ws.recorder_user = None
+                ws.recorder_call = None
+                ws.recorder_session = ""
+                await ws.save_to_mongo()
+                await ans.reply_text("✅ **Recorder removed from MongoDB!**", reply_markup=acc_menu_kb())
+            else:
+                idx = num - 1
+                u_cli = ws.broadcaster_users.pop(idx)
+                ws.broadcaster_calls.pop(idx)
+                ws.broadcaster_sessions.pop(idx)
+                await ws.save_to_mongo()
+                await u_cli.stop()
+                await ans.reply_text(f"✅ **Broadcaster #{num} removed from MongoDB!**", reply_markup=acc_menu_kb())
+        except Exception as e:
+            await ans.reply_text(f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
+
+
+# ==================== UTILITY SUB-MENU ACTIONS ====================
+@bot.on_callback_query(filters.regex(r"^util_"))
+async def util_actions_callbacks(client: Client, query: CallbackQuery):
+    if not is_authorized(None, None, query):
+        return await query.answer("⛔ Access Restricted!", show_alert=True)
+
+    uid = query.from_user.id
+    ws = await MANAGER.get_ws(uid)
+    u_cmd = query.data
+
+    if u_cmd == "util_ping":
+        t0 = time.perf_counter()
+        await query.answer("🏓 Pinging...")
+        ms = (time.perf_counter() - t0) * 1000
+        await query.message.edit_text(f"🏓 **Pong!** `{ms:.2f} ms`", reply_markup=util_menu_kb())
+
+    elif u_cmd == "util_stats":
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        up = int(time.time() - START_TIME)
+        h, r = divmod(up, 3600)
+        m, s = divmod(r, 60)
+        await query.message.edit_text(
+            f"📊 **System & Workspace Status**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 **Your Source:** `{ws.source_chat or 'None'}`\n"
+            f"🎙️ **Recording:** `{'🟢 Active' if ws.recording else '🔴 Stopped'}`\n"
+            f"🔗 **Your Targets:** `{len(ws.targets)}/{len(ws.broadcaster_users)}`\n"
+            f"💻 **CPU:** `{cpu}%` | 🧠 **RAM:** `{ram}%`\n"
+            f"⏱️ **Uptime:** `{h}h {m}m {s}s`",
+            reply_markup=util_menu_kb(),
+        )
+
+    elif u_cmd == "util_list":
+        if not ws.targets:
+            return await query.message.edit_text("📭 **No active target streams!**", reply_markup=util_menu_kb())
+        lines = [f"• `{tid}` (Broadcaster #{idx+1})" for tid, idx in ws.targets.items()]
+        await query.message.edit_text(
+            "🔗 **Your Active Forward List:**\n" + "\n".join(lines), reply_markup=util_menu_kb()
+        )
+
+    elif u_cmd == "util_id":
+        await query.message.edit_text(
+            f"🆔 **ID Information**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 **Your User ID:** `{uid}`\n"
+            f"💬 **Current Chat ID:** `{query.message.chat.id}`",
+            reply_markup=util_menu_kb(),
+        )
+
+
+# ==================== OWNER ADMIN PANEL ACTIONS ====================
+@bot.on_callback_query(filters.regex(r"^own_"))
+async def owner_actions_callbacks(client: Client, query: CallbackQuery):
+    if query.from_user.id != config.OWNER_ID:
+        return await query.answer("❌ Owner Only!", show_alert=True)
+
+    chat_id = query.message.chat.id
+    act = query.data
+
+    if act in ("own_approve", "own_disapprove", "own_ban", "own_unban"):
+        await query.answer()
+        prompts = {
+            "own_approve": "✅ **Send User ID to APPROVE (saves to MongoDB & notifies user):**",
+            "own_disapprove": "❌ **Send User ID to REMOVE ACCESS:**",
+            "own_ban": "🚫 **Send User ID to BAN:**",
+            "own_unban": "🟢 **Send User ID to UNBAN:**",
+        }
+        ans = await client.ask(chat_id, prompts[act] + "\n*(Or `/cancel`)*", timeout=60)
+        if ans.text.startswith("/cancel"):
+            return await ans.reply_text("🚫 **Cancelled!**", reply_markup=owner_menu_kb())
+        try:
+            t_uid = int(ans.text.strip())
+            if t_uid == config.OWNER_ID:
+                return await ans.reply_text("❌ **Cannot modify Owner ID!**", reply_markup=owner_menu_kb())
+
+            if act == "own_approve":
+                MANAGER.banned_users.discard(t_uid)
+                MANAGER.approved_users.add(t_uid)
+                await MANAGER.save_access_to_mongo()
+                await ans.reply_text(f"✅ **User `{t_uid}` approved in MongoDB!**", reply_markup=owner_menu_kb())
+                try:
+                    await client.send_message(
+                        t_uid,
+                        "🎉 **ACCESS APPROVED!**\nYou have been granted access to the bot. Send `/start`!",
+                        reply_markup=main_menu_kb(t_uid),
+                    )
+                except Exception:
+                    pass
+
+            elif act == "own_disapprove":
+                MANAGER.approved_users.discard(t_uid)
+                if t_uid in MANAGER.workspaces:
+                    await MANAGER.workspaces[t_uid].leave_all()
+                await MANAGER.save_access_to_mongo()
+                await ans.reply_text(f"❌ **Access removed from `{t_uid}`!**", reply_markup=owner_menu_kb())
+
+            elif act == "own_ban":
+                MANAGER.approved_users.discard(t_uid)
+                MANAGER.banned_users.add(t_uid)
+                if t_uid in MANAGER.workspaces:
+                    await MANAGER.workspaces[t_uid].leave_all()
+                await MANAGER.save_access_to_mongo()
+                await ans.reply_text(f"🚫 **User `{t_uid}` BANNED in MongoDB!**", reply_markup=owner_menu_kb())
+
+            elif act == "own_unban":
+                MANAGER.banned_users.discard(t_uid)
+                await MANAGER.save_access_to_mongo()
+                await ans.reply_text(f"🟢 **User `{t_uid}` UNBANNED!**", reply_markup=owner_menu_kb())
+        except Exception as e:
+            await ans.reply_text(f"❌ **Error:** `{e}`", reply_markup=owner_menu_kb())
+
+    elif act == "own_list":
+        app_s = ", ".join([f"`{u}`" for u in MANAGER.approved_users]) or "None"
+        ban_s = ", ".join([f"`{u}`" for u in MANAGER.banned_users]) or "None"
+        db_lines = [
+            f"• `{uid}`: Rec={'✅' if ws.recorder_user else '❌'} | Bcast={len(ws.broadcaster_users)}"
+            for uid, ws in MANAGER.workspaces.items()
+        ]
+        await query.message.edit_text(
+            f"📋 **MongoDB Database Overview**\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ **Approved IDs:** {app_s}\n"
+            f"🚫 **Banned IDs:** {ban_s}\n\n"
+            f"👥 **User Accounts in DB:**\n" + ("\n".join(db_lines) or "None"),
+            reply_markup=owner_menu_kb(),
+        )
+
+    elif act == "own_restart":
+        await query.answer("🔄 Restarting bot...", show_alert=True)
+        for ws in MANAGER.workspaces.values():
+            await ws.leave_all()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ==================== TEXT COMMAND HANDLERS (ALL COMMANDS SUPPORTED) ====================
 @bot.on_message(
-    filters.command(["level", "bass", "treble", "gain", "overdrive"]) & access_filter
-)
-async def fx_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    cmd = message.command[0].lower()
-    if len(message.command) < 2:
-        return await message.reply_text(f"❌ **Usage:** `/{cmd} <0-∞>`")
-    try:
-        val = float(message.command[1])
-    except ValueError:
-        return await message.reply_text("❌ **Invalid number!**")
-
-    ws.effects[cmd] = val
-    await ws.reload_streams()
-    await message.reply_text(
-        f"🎛️ **Your {cmd.capitalize()} set to `{val}`!**\n"
-        f"🔗 Applied to `{len(ws.targets)}` active target chats."
-    )
-
-
-@bot.on_message(filters.command("echo") & access_filter)
-async def echo_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if len(message.command) < 2:
-        return await message.reply_text("❌ **Usage:** `/echo <delay/decay>` or `/echo off`")
-    arg = message.command[1].lower()
-    if arg == "off":
-        ws.effects["echo"] = None
-        await ws.reload_streams()
-        return await message.reply_text("✅ **Your Echo effect is now OFF!**")
-    try:
-        parts = arg.split("/")
-        delay = int(parts[0])
-        decay = min(max(float(parts[1]) if len(parts) > 1 else 0.5, 0.1), 0.99)
-        ws.effects["echo"] = (delay, decay)
-        await ws.reload_streams()
-        await message.reply_text(f"✅ **Your Echo set to `{delay}ms / {decay}`!**")
-    except Exception:
-        await message.reply_text("❌ **Invalid format! Example:** `/echo 500/0.6`")
-
-
-@bot.on_message(filters.command("effects") & access_filter)
-async def effects_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    fx = ws.effects
-    echo_str = f"{fx['echo'][0]}ms/{fx['echo'][1]}" if fx["echo"] else "Off"
-    await message.reply_text(
-        f"🎛️ **Your Active Effects**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"• **Level:** `{fx['level']}`\n"
-        f"• **Bass:** `{fx['bass']} dB`\n"
-        f"• **Treble:** `{fx['treble']} dB`\n"
-        f"• **Gain:** `{fx['gain']} dB`\n"
-        f"• **Overdrive:** `{fx['overdrive']}`\n"
-        f"• **Echo:** `{echo_str}`"
-    )
-
-
-@bot.on_message(filters.command("reset") & access_filter)
-async def reset_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    for k in ws.effects:
-        ws.effects[k] = 1.0 if k == "level" else (None if k == "echo" else 0.0)
-    await ws.reload_streams()
-    await message.reply_text("🔄 **All your audio effects have been reset!**")
-
-
-# ==================== UTILITIES & DIRECT OWNER COMMANDS ====================
-@bot.on_message(filters.command("panel") & access_filter)
-async def panel_cmd(client: Client, message: Message):
-    uid = message.from_user.id
-    ws = MANAGER.get_ws(uid)
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔇 Mute", callback_data="ctl_mute"),
-            InlineKeyboardButton("🔊 Unmute", callback_data="ctl_unmute"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Reset FX", callback_data="ctl_reset"),
-            InlineKeyboardButton("🛑 Leave All", callback_data="ctl_leaveall"),
-        ],
-        [
-            InlineKeyboardButton("📱 My Accounts", callback_data="usr_accounts"),
-        ],
+    filters.command([
+        "help", "panel", "record", "setrecordgroup", "join", "leave", "leaveall",
+        "leaverecord", "rejoin", "mute", "unmute", "level", "bass", "treble",
+        "gain", "overdrive", "echo", "effects", "reset", "ping", "stats",
+        "status", "list", "id",
     ])
-    status = "🟢 Live" if ws.recording else "🔴 Idle"
-    await message.reply_text(
-        f"🎛️ **Your Personal Control Panel**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 **Source:** `{ws.source_chat or 'Not Set'}`\n"
-        f"🔗 **Active Targets:** `{len(ws.targets)}/{len(ws.broadcaster_users)}`\n"
-        f"📊 **Status:** {status}",
-        reply_markup=kb,
-    )
+)
+async def all_text_commands_router(client: Client, message: Message):
+    if not is_authorized(None, None, message):
+        return await handle_unauthorized_user(client, message)
 
-
-@bot.on_message(filters.command("list") & access_filter)
-async def list_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    if not ws.targets:
-        return await message.reply_text("📭 **You have no active target chats!**")
-    lines = [f"• `{t_id}` (Your Broadcaster #{b_idx+1})" for t_id, b_idx in ws.targets.items()]
-    await message.reply_text("🔗 **Your Forwarding List:**\n" + "\n".join(lines))
-
-
-@bot.on_message(filters.command(["status", "stats"]) & access_filter)
-async def status_cmd(client: Client, message: Message):
-    ws = MANAGER.get_ws(message.from_user.id)
-    cpu = psutil.cpu_percent()
-    ram = psutil.virtual_memory().percent
-    await message.reply_text(
-        f"📊 **Your Workspace & System Status**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎙️ **Your Recorder:** `{'✅ Ready' if ws.recorder_user else '❌ Not Set'}`\n"
-        f"📡 **Your Broadcasters:** `{len(ws.broadcaster_users)}`\n"
-        f"🎯 **Source Chat:** `{ws.source_chat or 'Not Set'}`\n"
-        f"🔗 **Forwarding:** `{len(ws.targets)} chats`\n"
-        f"💻 **Server CPU:** `{cpu}%` | 🧠 **RAM:** `{ram}%`"
-    )
-
-
-@bot.on_message(filters.command("id") & access_filter)
-async def id_cmd(client: Client, message: Message):
-    chat = message.chat
-    chat_type = str(chat.type).split(".")[-1].capitalize()
-    await message.reply_text(
-        f"🆔 **Chat Information**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 **Chat ID:** `{chat.id}`\n"
-        f"👤 **Your User ID:** `{message.from_user.id}`\n"
-        f"📊 **Type:** {chat_type}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-
-
-@bot.on_message(filters.command("ping") & access_filter)
-async def ping_cmd(client: Client, message: Message):
-    t0 = time.perf_counter()
-    m = await message.reply_text("🏓 **Pinging...**")
-    ms = (time.perf_counter() - t0) * 1000
-    await m.edit_text(f"🏓 **Pong!** `{ms:.2f} ms`")
-
-
-@bot.on_message(filters.command(["ban", "unban", "approve", "disapprove"]) & filters.user(config.OWNER_ID))
-async def owner_quick_cmds(client: Client, message: Message):
+    uid = message.from_user.id
+    ws = await MANAGER.get_ws(uid)
     cmd = message.command[0].lower()
+
+    if cmd in ("help", "panel"):
+        return await message.reply_text(
+            START_UI.format(mention=message.from_user.mention),
+            reply_markup=main_menu_kb(uid),
+        )
+
+    elif cmd == "id":
+        return await message.reply_text(
+            f"🆔 **Chat ID:** `{message.chat.id}`\n👤 **Your ID:** `{uid}`",
+            reply_markup=main_menu_kb(uid),
+        )
+
+    elif cmd == "ping":
+        t0 = time.perf_counter()
+        m = await message.reply_text("🏓 **Pinging...**")
+        ms = (time.perf_counter() - t0) * 1000
+        return await m.edit_text(f"🏓 **Pong!** `{ms:.2f} ms`", reply_markup=util_menu_kb())
+
+    elif cmd in ("stats", "status"):
+        cpu = psutil.cpu_percent()
+        ram = psutil.virtual_memory().percent
+        return await message.reply_text(
+            f"📊 **Status**\n📡 **Source:** `{ws.source_chat}`\n🔗 **Targets:** `{len(ws.targets)}`\n💻 **CPU:** `{cpu}%` | 🧠 **RAM:** `{ram}%`",
+            reply_markup=util_menu_kb(),
+        )
+
+    elif cmd == "list":
+        lines = [f"• `{t}`" for t in ws.targets] or ["📭 None"]
+        return await message.reply_text("🔗 **Forward List:**\n" + "\n".join(lines), reply_markup=util_menu_kb())
+
+    elif cmd == "setrecordgroup":
+        if len(message.command) < 2:
+            return await message.reply_text("❌ **Usage:** `/setrecordgroup <chat_id>`", reply_markup=audio_menu_kb(ws))
+        ws.source_chat = int(message.command[1])
+        await ws.save_to_mongo()
+        return await message.reply_text(f"✅ **Source saved:** `{ws.source_chat}`", reply_markup=audio_menu_kb(ws))
+
+    elif cmd == "record":
+        if len(message.command) > 1:
+            ws.source_chat = int(message.command[1])
+            await ws.save_to_mongo()
+        elif not ws.source_chat and message.chat.type.name != "PRIVATE":
+            ws.source_chat = message.chat.id
+            await ws.save_to_mongo()
+        if not ws.recorder_call or not ws.source_chat:
+            return await message.reply_text(
+                "❌ **Configure your Recorder Account & Source Chat first!**",
+                reply_markup=audio_menu_kb(ws),
+            )
+        await ws.start_bridge()
+        await ws.recorder_call.record(
+            ws.source_chat, RecordStream(ws.fifo_path, AudioParameters(bitrate=48000, channels=2))
+        )
+        ws.recording = True
+        return await message.reply_text(
+            f"✅ **Recording started on `{ws.source_chat}`!**", reply_markup=audio_menu_kb(ws)
+        )
+
+    elif cmd == "join":
+        if len(message.command) < 2:
+            return await message.reply_text("❌ **Usage:** `/join <target_id>`", reply_markup=audio_menu_kb(ws))
+        t_id = int(message.command[1])
+        b_idx = ws.targets.get(t_id, ws.get_free_broadcaster())
+        if b_idx is None:
+            return await message.reply_text("❌ **No free Broadcaster Account!**", reply_markup=acc_menu_kb())
+        await ws.broadcaster_calls[b_idx].play(t_id, ws.get_target_stream())
+        ws.targets[t_id] = b_idx
+        return await message.reply_text(f"✅ **Forwarding to `{t_id}`!**", reply_markup=audio_menu_kb(ws))
+
+    elif cmd == "leave":
+        if len(message.command) < 2:
+            return await message.reply_text("❌ **Usage:** `/leave <target_id>`")
+        tid = int(message.command[1])
+        if tid in ws.targets:
+            b_idx = ws.targets.pop(tid)
+            await ws.broadcaster_calls[b_idx].leave_call(tid)
+        return await message.reply_text(f"✅ **Left `{tid}`!**", reply_markup=audio_menu_kb(ws))
+
+    elif cmd == "leaveall":
+        cnt = await ws.leave_all()
+        return await message.reply_text(f"✅ **Disconnected all ({cnt}) chats!**", reply_markup=audio_menu_kb(ws))
+
+    elif cmd == "leaverecord":
+        if ws.source_chat and ws.recorder_call:
+            await ws.recorder_call.leave_call(ws.source_chat)
+        await ws.stop_bridge()
+        ws.recording = False
+        return await message.reply_text("✅ **Left Source Chat!**", reply_markup=audio_menu_kb(ws))
+
+    elif cmd == "rejoin":
+        await ws.reload_streams()
+        return await message.reply_text("🔄 **Reconnected all streams!**", reply_markup=audio_menu_kb(ws))
+
+    elif cmd in ("mute", "unmute"):
+        ws.muted = cmd == "mute"
+        for tid, idx in ws.targets.items():
+            if ws.muted:
+                await ws.broadcaster_calls[idx].mute_stream(tid)
+            else:
+                await ws.broadcaster_calls[idx].unmute_stream(tid)
+        return await message.reply_text(f"✅ **Streams {cmd}d!**", reply_markup=audio_menu_kb(ws))
+
+    elif cmd in ("level", "bass", "treble", "gain", "overdrive"):
+        if len(message.command) < 2:
+            return await message.reply_text(f"❌ **Usage:** `/{cmd} <val>`", reply_markup=fx_menu_kb(ws))
+        ws.effects[cmd] = float(message.command[1])
+        await ws.save_to_mongo()
+        await ws.reload_streams()
+        return await message.reply_text(f"🎛️ **{cmd.capitalize()} set to `{ws.effects[cmd]}`!**", reply_markup=fx_menu_kb(ws))
+
+    elif cmd == "echo":
+        if len(message.command) < 2 or message.command[1].lower() == "off":
+            ws.effects["echo"] = None
+        else:
+            p = message.command[1].split("/")
+            ws.effects["echo"] = (int(p[0]), float(p[1]) if len(p) > 1 else 0.5)
+        await ws.save_to_mongo()
+        await ws.reload_streams()
+        return await message.reply_text("✅ **Echo updated!**", reply_markup=fx_menu_kb(ws))
+
+    elif cmd == "effects":
+        return await message.reply_text(f"🎛️ **Effects:** `{ws.effects}`", reply_markup=fx_menu_kb(ws))
+
+    elif cmd == "reset":
+        ws.effects = {"level": 1.0, "bass": 0.0, "treble": 0.0, "gain": 0.0, "overdrive": 0.0, "echo": None}
+        await ws.save_to_mongo()
+        await ws.reload_streams()
+        return await message.reply_text("🔄 **Effects reset!**", reply_markup=fx_menu_kb(ws))
+
+
+# ==================== OWNER DIRECT COMMANDS ====================
+@bot.on_message(
+    filters.command(["owner", "approve", "disapprove", "ban", "unban", "userlist", "restart"])
+    & filters.user(config.OWNER_ID)
+)
+async def owner_direct_cmds(client: Client, message: Message):
+    cmd = message.command[0].lower()
+    if cmd == "owner":
+        return await message.reply_text("👑 **Owner Panel:**", reply_markup=owner_menu_kb())
+    elif cmd == "userlist":
+        return await message.reply_text(
+            f"✅ **Approved:** `{list(MANAGER.approved_users)}`\n🚫 **Banned:** `{list(MANAGER.banned_users)}`",
+            reply_markup=owner_menu_kb(),
+        )
+    elif cmd == "restart":
+        await message.reply_text("🔄 **Restarting...**")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
     uid = (
         message.reply_to_message.from_user.id
         if message.reply_to_message and message.reply_to_message.from_user
         else (int(message.command[1]) if len(message.command) > 1 else None)
     )
-    if not uid or uid == config.OWNER_ID:
-        return await message.reply_text(f"❌ **Usage:** `/{cmd} <user_id>`")
+    if not uid:
+        return await message.reply_text(f"❌ **Usage:** `/{cmd} <user_id>`", reply_markup=owner_menu_kb())
 
     if cmd == "approve":
         MANAGER.banned_users.discard(uid)
         MANAGER.approved_users.add(uid)
-        await message.reply_text(f"✅ **Approved `{uid}`!**")
+        await MANAGER.save_access_to_mongo()
+        await message.reply_text(f"✅ **Approved `{uid}` in MongoDB!**", reply_markup=owner_menu_kb())
+        try:
+            await client.send_message(
+                uid, "🎉 **You have been approved! Send `/start` to use the bot.**", reply_markup=main_menu_kb(uid)
+            )
+        except Exception:
+            pass
     elif cmd == "disapprove":
         MANAGER.approved_users.discard(uid)
         if uid in MANAGER.workspaces:
             await MANAGER.workspaces[uid].leave_all()
-        await message.reply_text(f"❌ **Removed access from `{uid}`!**")
+        await MANAGER.save_access_to_mongo()
+        await message.reply_text(f"❌ **Removed access for `{uid}`!**", reply_markup=owner_menu_kb())
     elif cmd == "ban":
         MANAGER.approved_users.discard(uid)
         MANAGER.banned_users.add(uid)
         if uid in MANAGER.workspaces:
             await MANAGER.workspaces[uid].leave_all()
-        await message.reply_text(f"🚫 **Banned `{uid}`!**")
+        await MANAGER.save_access_to_mongo()
+        await message.reply_text(f"🚫 **Banned `{uid}`!**", reply_markup=owner_menu_kb())
     elif cmd == "unban":
         MANAGER.banned_users.discard(uid)
-        await message.reply_text(f"🟢 **Unbanned `{uid}`!**")
-    MANAGER.sync_db()
+        await MANAGER.save_access_to_mongo()
+        await message.reply_text(f"🟢 **Unbanned `{uid}`!**", reply_markup=owner_menu_kb())
 
 
-@bot.on_message(filters.command("restart") & filters.user(config.OWNER_ID))
-async def restart_cmd(client: Client, message: Message):
-    await message.reply_text("🔄 **Restarting Multi-Tenant Bot...**")
-    for ws in MANAGER.workspaces.values():
-        await ws.leave_all()
-    os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-# ==================== BOOTSTRAP SAVED USER WORKSPACES ====================
+# ==================== BOOTSTRAP ====================
 async def bootstrap():
-    print("🚀 Starting Nobi Multi-Tenant Fight Bot...")
+    print("🚀 Starting Nobi Fight Bot with MongoDB...")
     await bot.start()
-
-    users_data = DB.get("users", {})
-    for uid_str, u_data in users_data.items():
-        uid = int(uid_str)
-        if uid in MANAGER.banned_users:
-            continue
-        ws = MANAGER.get_ws(uid)
-        if ws.recorder_session:
-            print(f"🎙️ Restoring Recorder for User {uid}...")
-            await ws.set_recorder(ws.recorder_session, save=False)
-        for b_sess in list(ws.broadcaster_sessions):
-            print(f"📡 Restoring Broadcaster for User {uid}...")
-            await ws.add_broadcaster(b_sess, save=False)
-
-    print("✅ Multi-Tenant Bot is LIVE! Every user can now login & stream from Bot DM.")
+    await MANAGER.load_from_mongo()
+    print("✅ Bot & MongoDB Workspaces are LIVE!")
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(bootstrap())
+EOF
