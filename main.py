@@ -7,28 +7,6 @@ import subprocess
 import psutil
 from typing import Dict, Set, List, Optional
 
-# ==================== PYROMOD COMPATIBILITY PATCH ====================
-from pyrogram.handlers.handler import ListenerTypes
-from pyrogram import Client
-
-_orig_start = Client.start
-async def _patched_start(self, *args, **kwargs):
-    if not hasattr(self, "listeners") or self.listeners is None:
-        self.listeners = {
-            ListenerTypes.MESSAGE: [],
-            ListenerTypes.CALLBACK_QUERY: [],
-            ListenerTypes.INLINE_QUERY: []
-        }
-    else:
-        for l_type in [ListenerTypes.MESSAGE, ListenerTypes.CALLBACK_QUERY, ListenerTypes.INLINE_QUERY]:
-            if l_type not in self.listeners:
-                self.listeners[l_type] = []
-    return await _orig_start(self, *args, **kwargs)
-
-Client.start = _patched_start
-import pyromod
-# ===================================================================
-
 # ==================== PYROGRAM ANTI-CRASH PATCH ====================
 import pyrogram.errors
 class DummyGroupcallError(pyrogram.errors.BadRequest): pass
@@ -64,8 +42,9 @@ for _name in _FALLBACK_RAWS:
         setattr(_phone_ns, _name, _Dummy)
 # ===================================================================
 
+import pyromod
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import filters
+from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
     CallbackQuery,
@@ -448,7 +427,8 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
                 f"🎵 **Audio Controls Sub-Menu**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"📡 **Source Chat ID:** `{ws.source_chat or 'Not Set'}`\n"
                 f"🔗 **Active Targets:** `{len(ws.targets)}/{len(ws.broadcaster_users)}`\n"
-                f"🔇 **Muted:** `{ws.muted}` | 📊 **Status:** {status}\n━━━━━━━━━━━━━━━━━━━━", reply_markup=audio_menu_kb(ws))
+                f"🔇 **Muted:** `{ws.muted}` | 📊 **Status:** {status}\n━━━━━━━━━━━━━━━━━━━━", reply_markup=audio_menu_kb(ws)
+            )
         elif menu == "menu_fx":
             await query.message.edit_text("🎛️ **DSP Audio Effects Sub-Menu**\n━━━━━━━━━━━━━━━━━━━━", reply_markup=fx_menu_kb(ws))
         elif menu == "menu_acc":
@@ -456,7 +436,8 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
             await query.message.edit_text(
                 f"📱 **My Accounts (MongoDB Saved)**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎙️ **Recorder Account:** `{rec_s}`\n"
-                f"📡 **Broadcaster Accounts:** `{len(ws.broadcaster_users)} active`\n━━━━━━━━━━━━━━━━━━━━", reply_markup=acc_menu_kb())
+                f"📡 **Broadcaster Accounts:** `{len(ws.broadcaster_users)} active`\n━━━━━━━━━━━━━━━━━━━━", reply_markup=acc_menu_kb()
+            )
         elif menu == "menu_util":
             await query.message.edit_text("📊 **Utility & System Status Sub-Menu**\n━━━━━━━━━━━━━━━━━━━━", reply_markup=util_menu_kb())
         elif menu == "menu_help":
@@ -466,7 +447,8 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
             await query.message.edit_text(
                 f"👑 **Master Owner Control Panel (MongoDB)**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ **Approved Users:** `{len(MANAGER.approved_users)}`\n"
-                f"🚫 **Banned Users:** `{len(MANAGER.banned_users)}`", reply_markup=owner_menu_kb())
+                f"🚫 **Banned Users:** `{len(MANAGER.banned_users)}`", reply_markup=owner_menu_kb()
+            )
     except MessageNotModified: await query.answer()
 
 # ==================== AUDIO ACTIONS ====================
