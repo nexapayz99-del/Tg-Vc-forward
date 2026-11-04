@@ -215,7 +215,10 @@ class UserWorkspace:
             logger.info(f"Recorder account connected successfully for user {self.user_id}")
             return True
         except Exception as e:
-            logger.error(f"User {self.user_id} Recorder error: {e}")
+            logger.error(f"User {self.user_id} Recorder error (clearing bad session): {e}")
+            self.recorder_session = ""
+            if save:
+                await self.save_to_mongo()
             return False
 
     async def add_broadcaster(self, session_str: str, save: bool = True) -> bool:
@@ -246,6 +249,10 @@ class UserWorkspace:
             return True
         except Exception as e:
             logger.error(f"User {self.user_id} Broadcaster error: {e}")
+            if session_str in self.broadcaster_sessions:
+                self.broadcaster_sessions.remove(session_str)
+                if save:
+                    await self.save_to_mongo()
             return False
 
     def get_free_broadcaster(self) -> Optional[int]:
