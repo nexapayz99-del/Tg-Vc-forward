@@ -7,23 +7,38 @@ import subprocess
 import psutil
 from typing import Dict, Set, List, Optional
 
+# ==================== PYROMOD COMPATIBILITY PATCH ====================
+from pyrogram.handlers.handler import ListenerTypes
+from pyrogram import Client
+
+_orig_start = Client.start
+async def _patched_start(self, *args, **kwargs):
+    if not hasattr(self, "listeners") or self.listeners is None:
+        self.listeners = {
+            ListenerTypes.MESSAGE: [],
+            ListenerTypes.CALLBACK_QUERY: [],
+            ListenerTypes.INLINE_QUERY: []
+        }
+    else:
+        for l_type in [ListenerTypes.MESSAGE, ListenerTypes.CALLBACK_QUERY, ListenerTypes.INLINE_QUERY]:
+            if l_type not in self.listeners:
+                self.listeners[l_type] = []
+    return await _orig_start(self, *args, **kwargs)
+
+Client.start = _patched_start
+import pyromod
+# ===================================================================
+
 # ==================== PYROGRAM ANTI-CRASH PATCH ====================
-# This intercepts and mocks missing Pyrogram Voice Chat dependencies
-# so py-tgcalls can initialize safely on any library version.
 import pyrogram.errors
-class DummyGroupcallError(pyrogram.errors.BadRequest):
-    pass
-
+class DummyGroupcallError(pyrogram.errors.BadRequest): pass
 for _err in ['GroupcallForbidden','GroupCallForbidden','GroupcallInvalid','GroupCallInvalid','GroupcallNotFound','GroupCallNotFound']:
-    if not hasattr(pyrogram.errors, _err):
-        setattr(pyrogram.errors, _err, DummyGroupcallError)
-
+    if not hasattr(pyrogram.errors, _err): setattr(pyrogram.errors, _err, DummyGroupcallError)
 try:
     import pyrogram.errors.exceptions.forbidden_403 as _f403
     for _err in ['GroupcallForbidden','GroupCallForbidden']:
         if not hasattr(_f403, _err): setattr(_f403, _err, DummyGroupcallError)
 except ImportError: pass
-
 try:
     import pyrogram.errors.exceptions.bad_request_400 as _b400
     for _err in ['GroupcallInvalid','GroupCallInvalid','GroupcallNotFound','GroupCallNotFound']:
@@ -49,9 +64,8 @@ for _name in _FALLBACK_RAWS:
         setattr(_phone_ns, _name, _Dummy)
 # ===================================================================
 
-import pyromod
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client, filters
+from pyrogram import filters
 from pyrogram.types import (
     Message,
     CallbackQuery,
@@ -65,7 +79,6 @@ from pytgcalls.types.raw import AudioParameters
 
 import config
 
-# ==================== DEBUG LOGGING SETUP ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -75,22 +88,14 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("NobiFightBot")
-
 START_TIME = time.time()
 
-# ==================== MONGODB INITIALIZATION ====================
 mongo_client = AsyncIOMotorClient(config.MONGO_URI)
 db = mongo_client[config.DB_NAME]
 users_col = db["users"]
 access_col = db["access"]
 
-bot = Client(
-    "NobiFightBot",
-    api_id=config.API_ID,
-    api_hash=config.API_HASH,
-    bot_token=config.BOT_TOKEN,
-)
-
+bot = Client("NobiFightBot", api_id=config.API_ID, api_hash=config.API_HASH, bot_token=config.BOT_TOKEN)
 
 # ==================== HELPER: REAL-TIME PROGRESS BAR ====================
 async def show_progress_bar(msg: Message, action_name: str, total_steps: int = 5):
@@ -100,19 +105,10 @@ async def show_progress_bar(msg: Message, action_name: str, total_steps: int = 5
         empty = "░" * (total_steps - step)
         bar = f"[{filled}{empty}] {percent}%"
         try:
-            await msg.edit_text(
-                f"⚙️ **{action_name} in progress...**\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{bar}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Please wait..."
-            )
-        except MessageNotModified:
-            pass
-        except Exception:
-            pass
+            await msg.edit_text(f"⚙️ **{action_name}...**\n━━━━━━━━━━━━━━━━━━━━\n{bar}\n━━━━━━━━━━━━━━━━━━━━")
+        except MessageNotModified: pass
+        except Exception: pass
         await asyncio.sleep(0.3)
-
 
 # ==================== PER-USER ISOLATED WORKSPACE ====================
 class UserWorkspace:
@@ -122,19 +118,15 @@ class UserWorkspace:
         self.recording: bool = False
         self.muted: bool = False
         self.targets: Dict[int, int] = {}
-
         self.recorder_session: str = doc.get("recorder", "")
         self.broadcaster_sessions: List[str] = list(doc.get("broadcasters", []))
-
         self.recorder_user: Optional[Client] = None
         self.recorder_call: Optional[PyTgCalls] = None
         self.broadcaster_users: List[Client] = []
         self.broadcaster_calls: List[PyTgCalls] = []
-
         self.fifo_path = f"/tmp/nobi_fifo_{user_id}.pcm"
         self.sink_name = f"FightSink_{user_id}"
         self.ffmpeg_proc: Optional[asyncio.subprocess.Process] = None
-
         saved_fx = doc.get("effects", {})
         self.effects = {
             "level": saved_fx.get("level", 1.0),
@@ -144,7 +136,6 @@ class UserWorkspace:
             "overdrive": saved_fx.get("overdrive", 0.0),
             "echo": tuple(saved_fx["echo"]) if saved_fx.get("echo") else None,
         }
-
         self._setup_audio_pipe()
 
     def _setup_audio_pipe(self):
@@ -152,15 +143,10 @@ class UserWorkspace:
             try: os.remove(self.fifo_path)
             except Exception: pass
         os.mkfifo(self.fifo_path)
-
         try:
-            subprocess.run(
-                ["pactl", "load-module", "module-null-sink", f"sink_name={self.sink_name}"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
+            subprocess.run(["pactl", "load-module", "module-null-sink", f"sink_name={self.sink_name}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception: pass
 
     async def save_to_mongo(self):
         doc = {
@@ -168,13 +154,9 @@ class UserWorkspace:
             "recorder": self.recorder_session,
             "broadcasters": self.broadcaster_sessions,
             "source_chat": self.source_chat,
-            "effects": {
-                **self.effects,
-                "echo": list(self.effects["echo"]) if self.effects["echo"] else None,
-            },
+            "effects": {**self.effects, "echo": list(self.effects["echo"]) if self.effects["echo"] else None},
         }
         await users_col.update_one({"user_id": self.user_id}, {"$set": doc}, upsert=True)
-        logger.info(f"MongoDB synced successfully for user {self.user_id}")
 
     def build_ffmpeg_filters(self) -> str:
         fx = self.effects
@@ -201,19 +183,12 @@ class UserWorkspace:
 
     async def start_bridge(self):
         await self.stop_bridge()
-        cmd = [
-            "ffmpeg", "-y", "-f", "s16le", "-ac", "2", "-ar", "48000",
-            "-i", self.fifo_path, "-f", "pulse", self.sink_name,
-        ]
-        self.ffmpeg_proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
+        cmd = ["ffmpeg", "-y", "-f", "s16le", "-ac", "2", "-ar", "48000", "-i", self.fifo_path, "-f", "pulse", self.sink_name]
+        self.ffmpeg_proc = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     async def stop_bridge(self):
         if self.ffmpeg_proc:
-            try:
-                self.ffmpeg_proc.terminate()
-                await self.ffmpeg_proc.wait()
+            try: self.ffmpeg_proc.terminate(); await self.ffmpeg_proc.wait()
             except Exception: pass
             self.ffmpeg_proc = None
 
@@ -223,24 +198,15 @@ class UserWorkspace:
             if self.recorder_user:
                 try: await self.recorder_user.stop()
                 except Exception: pass
-            u_cli = Client(
-                f"Rec_{self.user_id}_{int(time.time())}",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                session_string=session_str,
-                in_memory=True,
-                no_updates=True,
-            )
+            u_cli = Client(f"Rec_{self.user_id}_{int(time.time())}", api_id=config.API_ID, api_hash=config.API_HASH, session_string=session_str, in_memory=True, no_updates=True)
             await u_cli.start()
             c_cli = PyTgCalls(u_cli)
             try: await c_cli.start()
             except Exception as call_err: logger.warning(f"PyTgCalls start notice (Recorder): {call_err}")
-
             self.recorder_user = u_cli
             self.recorder_call = c_cli
             self.recorder_session = session_str
             if save: await self.save_to_mongo()
-            logger.info(f"Recorder connected successfully for user {self.user_id}")
             return True
         except Exception as e:
             logger.error(f"User {self.user_id} Recorder error: {e}")
@@ -251,25 +217,16 @@ class UserWorkspace:
     async def add_broadcaster(self, session_str: str, save: bool = True) -> bool:
         if not session_str: return False
         try:
-            u_cli = Client(
-                f"Bcast_{self.user_id}_{len(self.broadcaster_users)+1}_{int(time.time())}",
-                api_id=config.API_ID,
-                api_hash=config.API_HASH,
-                session_string=session_str,
-                in_memory=True,
-                no_updates=True,
-            )
+            u_cli = Client(f"Bcast_{self.user_id}_{len(self.broadcaster_users)+1}_{int(time.time())}", api_id=config.API_ID, api_hash=config.API_HASH, session_string=session_str, in_memory=True, no_updates=True)
             await u_cli.start()
             c_cli = PyTgCalls(u_cli)
             try: await c_cli.start()
             except Exception as call_err: logger.warning(f"PyTgCalls start notice (Broadcaster): {call_err}")
-
             self.broadcaster_users.append(u_cli)
             self.broadcaster_calls.append(c_cli)
             if save and session_str not in self.broadcaster_sessions:
                 self.broadcaster_sessions.append(session_str)
                 await self.save_to_mongo()
-            logger.info(f"Broadcaster connected successfully for user {self.user_id}")
             return True
         except Exception as e:
             logger.error(f"User {self.user_id} Broadcaster error: {e}")
@@ -299,14 +256,12 @@ class UserWorkspace:
             try: await self.broadcaster_calls[b_idx].leave_call(t_id)
             except Exception: pass
         self.targets.clear()
-
         if self.source_chat and self.recorder_call:
             try: await self.recorder_call.leave_call(self.source_chat)
             except Exception: pass
         await self.stop_bridge()
         self.recording = False
         return count
-
 
 # ==================== GLOBAL ACCESS & WORKSPACE MANAGER ====================
 class GlobalManager:
@@ -322,25 +277,19 @@ class GlobalManager:
             self.approved_users = set(acc_doc.get("approved_users", [config.OWNER_ID]))
             self.approved_users.add(config.OWNER_ID)
             self.banned_users = set(acc_doc.get("banned_users", []))
-        else:
-            await self.save_access_to_mongo()
+        else: await self.save_access_to_mongo()
 
         async for u_doc in users_col.find({}):
             uid = u_doc["user_id"]
             if uid in self.banned_users: continue
             ws = UserWorkspace(uid, u_doc)
             self.workspaces[uid] = ws
-            if ws.recorder_session:
-                await ws.set_recorder(ws.recorder_session, save=False)
-            for b_str in list(ws.broadcaster_sessions):
-                await ws.add_broadcaster(b_str, save=False)
+            if ws.recorder_session: await ws.set_recorder(ws.recorder_session, save=False)
+            for b_str in list(ws.broadcaster_sessions): await ws.add_broadcaster(b_str, save=False)
 
     async def save_access_to_mongo(self):
-        await access_col.update_one(
-            {"_id": "global_access"},
-            {"$set": {"approved_users": list(self.approved_users), "banned_users": list(self.banned_users)}},
-            upsert=True,
-        )
+        await access_col.update_one({"_id": "global_access"},
+            {"$set": {"approved_users": list(self.approved_users), "banned_users": list(self.banned_users)}}, upsert=True)
 
     async def get_ws(self, user_id: int) -> UserWorkspace:
         if user_id not in self.workspaces:
@@ -348,11 +297,8 @@ class GlobalManager:
             self.workspaces[user_id] = UserWorkspace(user_id, u_doc)
         return self.workspaces[user_id]
 
-
 MANAGER = GlobalManager()
 
-
-# ==================== ACCESS GUARD ====================
 def is_authorized(_, __, update: Message | CallbackQuery) -> bool:
     user = update.from_user
     if not user: return False
@@ -361,25 +307,18 @@ def is_authorized(_, __, update: Message | CallbackQuery) -> bool:
 
 auth_filter = filters.create(is_authorized)
 
-
 async def handle_unauthorized_user(client: Client, message: Message):
     user = message.from_user
     if not user: return
-    if user.id in MANAGER.banned_users:
-        return await message.reply_text("🚫 **You are BANNED from using this bot.**")
-
+    if user.id in MANAGER.banned_users: return await message.reply_text("🚫 **You are BANNED from using this bot.**")
     user_tag = f"@{user.username}" if user.username else user.mention
     restricted_text = (
-        f"⛔  **ACCESS RESTRICTED**\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Hello {user_tag},\n\n"
-        f"You need approval to use this bot.\n"
-        f"📩 Request forwarded to admins.\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⛔  **ACCESS RESTRICTED**\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"Hello {user_tag},\n\nYou need approval to use this bot.\n"
+        f"📩 Request forwarded to admins.\n━━━━━━━━━━━━━━━━━━━━\n"
         f"You will be notified once approved."
     )
     await message.reply_text(restricted_text)
-
     if user.id not in MANAGER.notified_pending:
         MANAGER.notified_pending.add(user.id)
         kb = InlineKeyboardMarkup([
@@ -387,17 +326,11 @@ async def handle_unauthorized_user(client: Client, message: Message):
              InlineKeyboardButton("🚫 Ban User", callback_data=f"req_ban_{user.id}")]
         ])
         try:
-            await client.send_message(
-                config.OWNER_ID,
-                f"📩 **NEW ACCESS REQUEST**\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
+            await client.send_message(config.OWNER_ID,
+                f"📩 **NEW ACCESS REQUEST**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"👤 **User:** {user.mention} ({user_tag})\n"
-                f"🆔 **User ID:** `{user.id}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n",
-                reply_markup=kb,
-            )
+                f"🆔 **User ID:** `{user.id}`\n━━━━━━━━━━━━━━━━━━━━\n", reply_markup=kb)
         except Exception as e: logger.error(f"Could not notify owner: {e}")
-
 
 # ==================== UI & SUB-MENUS ====================
 START_UI = """✨ **Welcome to Audio Forwarder** ✨
@@ -430,15 +363,11 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 def audio_menu_kb(ws: UserWorkspace) -> InlineKeyboardMarkup:
     rec_lbl = "🟢 Recording (Restart)" if ws.recording else "🎙️ Start Recording (/record)"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(rec_lbl, callback_data="act_record"),
-         InlineKeyboardButton("🎯 Set Source Chat", callback_data="act_setsource")],
-        [InlineKeyboardButton("➕ Join Target VC (/join)", callback_data="act_join"),
-         InlineKeyboardButton("➖ Leave Target VC (/leave)", callback_data="act_leave")],
-        [InlineKeyboardButton("🔇 Mute All (/mute)", callback_data="act_mute"),
-         InlineKeyboardButton("🔊 Unmute All (/unmute)", callback_data="act_unmute")],
-        [InlineKeyboardButton("🔄 Rejoin All (/rejoin)", callback_data="act_rejoin"),
-         InlineKeyboardButton("⏹️ Leave Source (/leaverecord)", callback_data="act_leaverec")],
-        [InlineKeyboardButton("🛑 Disconnect All (/leaveall)", callback_data="act_leaveall")],
+        [InlineKeyboardButton(rec_lbl, callback_data="act_record"), InlineKeyboardButton("🎯 Set Source Chat", callback_data="act_setsource")],
+        [InlineKeyboardButton("➕ Join Target VC", callback_data="act_join"), InlineKeyboardButton("➖ Leave Target VC", callback_data="act_leave")],
+        [InlineKeyboardButton("🔇 Mute All", callback_data="act_mute"), InlineKeyboardButton("🔊 Unmute All", callback_data="act_unmute")],
+        [InlineKeyboardButton("🔄 Rejoin All", callback_data="act_rejoin"), InlineKeyboardButton("⏹️ Leave Source", callback_data="act_leaverec")],
+        [InlineKeyboardButton("🛑 Disconnect All", callback_data="act_leaveall")],
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main")]
     ])
 
@@ -446,47 +375,35 @@ def fx_menu_kb(ws: UserWorkspace) -> InlineKeyboardMarkup:
     fx = ws.effects
     echo_lbl = f"{fx['echo'][0]}ms" if fx["echo"] else "Off"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🔊 Level ({fx['level']})", callback_data="fx_level"),
-         InlineKeyboardButton(f"🎸 Bass ({fx['bass']}dB)", callback_data="fx_bass")],
-        [InlineKeyboardButton(f"🎻 Treble ({fx['treble']}dB)", callback_data="fx_treble"),
-         InlineKeyboardButton(f"⚡ Gain ({fx['gain']}dB)", callback_data="fx_gain")],
-        [InlineKeyboardButton(f"🔥 Overdrive ({fx['overdrive']})", callback_data="fx_overdrive"),
-         InlineKeyboardButton(f"🗣️ Echo ({echo_lbl})", callback_data="fx_echo")],
-        [InlineKeyboardButton("📋 Show Active Effects", callback_data="fx_show"),
-         InlineKeyboardButton("🔄 Reset All Effects", callback_data="fx_reset")],
+        [InlineKeyboardButton(f"🔊 Level ({fx['level']})", callback_data="fx_level"), InlineKeyboardButton(f"🎸 Bass ({fx['bass']}dB)", callback_data="fx_bass")],
+        [InlineKeyboardButton(f"🎻 Treble ({fx['treble']}dB)", callback_data="fx_treble"), InlineKeyboardButton(f"⚡ Gain ({fx['gain']}dB)", callback_data="fx_gain")],
+        [InlineKeyboardButton(f"🔥 Overdrive ({fx['overdrive']})", callback_data="fx_overdrive"), InlineKeyboardButton(f"🗣️ Echo ({echo_lbl})", callback_data="fx_echo")],
+        [InlineKeyboardButton("📋 Show Active Effects", callback_data="fx_show"), InlineKeyboardButton("🔄 Reset All Effects", callback_data="fx_reset")],
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main")]
     ])
 
 def acc_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📱 Login Account via Phone (OTP & 2FA)", callback_data="acc_otp")],
-        [InlineKeyboardButton("🎙️ Set Recorder (String)", callback_data="acc_rec_str"),
-         InlineKeyboardButton("➕ Add Broadcaster (String)", callback_data="acc_bcast_str")],
-        [InlineKeyboardButton("📋 View My Saved DB Accounts", callback_data="acc_view"),
-         InlineKeyboardButton("🗑️ Delete Account from DB", callback_data="acc_del")],
+        [InlineKeyboardButton("🎙️ Set Recorder (String)", callback_data="acc_rec_str"), InlineKeyboardButton("➕ Add Broadcaster (String)", callback_data="acc_bcast_str")],
+        [InlineKeyboardButton("📋 View My Saved DB Accounts", callback_data="acc_view"), InlineKeyboardButton("🗑️ Delete Account from DB", callback_data="acc_del")],
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main")]
     ])
 
 def util_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏓 Ping Latency", callback_data="util_ping"),
-         InlineKeyboardButton("📊 System & Bot Stats", callback_data="util_stats")],
-        [InlineKeyboardButton("🔗 Active Forward List", callback_data="util_list"),
-         InlineKeyboardButton("🆔 My ID & Info", callback_data="util_id")],
+        [InlineKeyboardButton("🏓 Ping Latency", callback_data="util_ping"), InlineKeyboardButton("📊 System & Bot Stats", callback_data="util_stats")],
+        [InlineKeyboardButton("🔗 Active Forward List", callback_data="util_list"), InlineKeyboardButton("🆔 My ID & Info", callback_data="util_id")],
         [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main")]
     ])
 
 def owner_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Approve User ID", callback_data="own_approve"),
-         InlineKeyboardButton("❌ Remove Access", callback_data="own_disapprove")],
-        [InlineKeyboardButton("🚫 Ban User ID", callback_data="own_ban"),
-         InlineKeyboardButton("🟢 Unban User ID", callback_data="own_unban")],
+        [InlineKeyboardButton("✅ Approve User ID", callback_data="own_approve"), InlineKeyboardButton("❌ Remove Access", callback_data="own_disapprove")],
+        [InlineKeyboardButton("🚫 Ban User ID", callback_data="own_ban"), InlineKeyboardButton("🟢 Unban User ID", callback_data="own_unban")],
         [InlineKeyboardButton("📋 View All Approved, Banned & DB Users", callback_data="own_list")],
-        [InlineKeyboardButton("🔄 Restart Bot Server", callback_data="own_restart"),
-         InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main")]
+        [InlineKeyboardButton("🔄 Restart Bot Server", callback_data="own_restart"), InlineKeyboardButton("🏠 Back to Main Menu", callback_data="menu_main")]
     ])
-
 
 # ==================== /START HANDLER ====================
 @bot.on_message(filters.command("start"))
@@ -494,37 +411,26 @@ async def start_cmd(client: Client, message: Message):
     if not is_authorized(None, None, message): return await handle_unauthorized_user(client, message)
     uid = message.from_user.id
     await MANAGER.get_ws(uid)
-    await message.reply_text(
-        START_UI.format(mention=message.from_user.mention),
-        reply_markup=main_menu_kb(uid)
-    )
+    await message.reply_text(START_UI.format(mention=message.from_user.mention), reply_markup=main_menu_kb(uid))
 
 # ==================== OWNER APPROVAL BUTTONS ====================
 @bot.on_callback_query(filters.regex(r"^req_(app|ban)_(\d+)$"))
 async def handle_access_request_buttons(client: Client, query: CallbackQuery):
-    if query.from_user.id != config.OWNER_ID:
-        return await query.answer("❌ Only the Bot Owner can do this!", show_alert=True)
+    if query.from_user.id != config.OWNER_ID: return await query.answer("❌ Only the Bot Owner can do this!", show_alert=True)
     action, target_str = query.data.split("_")[1], query.data.split("_")[2]
     target_uid = int(target_str)
-
     if action == "app":
-        MANAGER.banned_users.discard(target_uid)
-        MANAGER.approved_users.add(target_uid)
-        MANAGER.notified_pending.discard(target_uid)
+        MANAGER.banned_users.discard(target_uid); MANAGER.approved_users.add(target_uid); MANAGER.notified_pending.discard(target_uid)
         await MANAGER.save_access_to_mongo()
         try: await query.message.edit_text(f"{query.message.text}\n\n✅ **STATUS: APPROVED BY OWNER**")
         except MessageNotModified: pass
-        try:
-            await client.send_message(target_uid, "🎉 **ACCESS APPROVED!**\nYou now have full access.", reply_markup=main_menu_kb(target_uid))
+        try: await client.send_message(target_uid, "🎉 **ACCESS APPROVED!**\nYou now have full access.", reply_markup=main_menu_kb(target_uid))
         except Exception: pass
     else:
-        MANAGER.approved_users.discard(target_uid)
-        MANAGER.banned_users.add(target_uid)
-        MANAGER.notified_pending.discard(target_uid)
+        MANAGER.approved_users.discard(target_uid); MANAGER.banned_users.add(target_uid); MANAGER.notified_pending.discard(target_uid)
         await MANAGER.save_access_to_mongo()
         try: await query.message.edit_text(f"{query.message.text}\n\n🚫 **STATUS: BANNED BY OWNER**")
         except MessageNotModified: pass
-
 
 # ==================== SUB-MENU ROUTER ====================
 @bot.on_callback_query(filters.regex(r"^menu_"))
@@ -533,7 +439,6 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
     uid = query.from_user.id
     ws = await MANAGER.get_ws(uid)
     menu = query.data
-
     try:
         if menu == "menu_main":
             await query.message.edit_text(START_UI.format(mention=query.from_user.mention), reply_markup=main_menu_kb(uid))
@@ -543,9 +448,7 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
                 f"🎵 **Audio Controls Sub-Menu**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"📡 **Source Chat ID:** `{ws.source_chat or 'Not Set'}`\n"
                 f"🔗 **Active Targets:** `{len(ws.targets)}/{len(ws.broadcaster_users)}`\n"
-                f"🔇 **Muted:** `{ws.muted}` | 📊 **Status:** {status}\n━━━━━━━━━━━━━━━━━━━━",
-                reply_markup=audio_menu_kb(ws)
-            )
+                f"🔇 **Muted:** `{ws.muted}` | 📊 **Status:** {status}\n━━━━━━━━━━━━━━━━━━━━", reply_markup=audio_menu_kb(ws))
         elif menu == "menu_fx":
             await query.message.edit_text("🎛️ **DSP Audio Effects Sub-Menu**\n━━━━━━━━━━━━━━━━━━━━", reply_markup=fx_menu_kb(ws))
         elif menu == "menu_acc":
@@ -553,9 +456,7 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
             await query.message.edit_text(
                 f"📱 **My Accounts (MongoDB Saved)**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎙️ **Recorder Account:** `{rec_s}`\n"
-                f"📡 **Broadcaster Accounts:** `{len(ws.broadcaster_users)} active`\n━━━━━━━━━━━━━━━━━━━━",
-                reply_markup=acc_menu_kb()
-            )
+                f"📡 **Broadcaster Accounts:** `{len(ws.broadcaster_users)} active`\n━━━━━━━━━━━━━━━━━━━━", reply_markup=acc_menu_kb())
         elif menu == "menu_util":
             await query.message.edit_text("📊 **Utility & System Status Sub-Menu**\n━━━━━━━━━━━━━━━━━━━━", reply_markup=util_menu_kb())
         elif menu == "menu_help":
@@ -565,11 +466,8 @@ async def sub_menu_router(client: Client, query: CallbackQuery):
             await query.message.edit_text(
                 f"👑 **Master Owner Control Panel (MongoDB)**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ **Approved Users:** `{len(MANAGER.approved_users)}`\n"
-                f"🚫 **Banned Users:** `{len(MANAGER.banned_users)}`",
-                reply_markup=owner_menu_kb()
-            )
+                f"🚫 **Banned Users:** `{len(MANAGER.banned_users)}`", reply_markup=owner_menu_kb())
     except MessageNotModified: await query.answer()
-
 
 # ==================== AUDIO ACTIONS ====================
 @bot.on_callback_query(filters.regex(r"^act_"))
@@ -587,7 +485,6 @@ async def audio_actions_callbacks(client: Client, query: CallbackQuery):
             ws.source_chat = int(ans.text.strip())
             await ws.save_to_mongo()
             await ans.reply_text(f"✅ **Source Chat saved:** `{ws.source_chat}`", reply_markup=audio_menu_kb(ws))
-
     elif act == "act_record":
         if not ws.recorder_call or not ws.source_chat: return await query.answer("❌ Configure Recorder & Source Chat first!", show_alert=True)
         await query.answer()
@@ -598,7 +495,6 @@ async def audio_actions_callbacks(client: Client, query: CallbackQuery):
         ws.recording = True
         try: await p_msg.edit_text(f"✅ **Recording active on `{ws.source_chat}`!**", reply_markup=audio_menu_kb(ws))
         except MessageNotModified: pass
-
     elif act == "act_join":
         await query.answer()
         ans = await client.ask(chat_id, "➕ **Send Target Chat ID:**", timeout=60)
@@ -612,14 +508,12 @@ async def audio_actions_callbacks(client: Client, query: CallbackQuery):
             ws.targets[t_id] = b_idx
             try: await p_msg.edit_text(f"✅ **Connected & streaming to `{t_id}`!**", reply_markup=audio_menu_kb(ws))
             except MessageNotModified: pass
-
     elif act == "act_leaveall":
         p_msg = await query.message.edit_text("⚙️ Disconnecting all streams...")
         await show_progress_bar(p_msg, "Shutting Down Streams")
         cnt = await ws.leave_all()
         try: await p_msg.edit_text(f"✅ **Disconnected all ({cnt}) streams!**", reply_markup=audio_menu_kb(ws))
         except MessageNotModified: pass
-
     elif act == "act_mute":
         ws.muted = True
         for tid, idx in ws.targets.items(): await ws.broadcaster_calls[idx].mute_stream(tid)
@@ -632,7 +526,6 @@ async def audio_actions_callbacks(client: Client, query: CallbackQuery):
         await ws.reload_streams()
         await query.answer("🔄 Reconnected streams!", show_alert=True)
 
-
 # ==================== DSP EFFECTS ACTIONS ====================
 @bot.on_callback_query(filters.regex(r"^fx_"))
 async def fx_actions_callbacks(client: Client, query: CallbackQuery):
@@ -641,22 +534,18 @@ async def fx_actions_callbacks(client: Client, query: CallbackQuery):
     ws = await MANAGER.get_ws(uid)
     cmd = query.data.replace("fx_", "")
     try:
-        if cmd == "show":
-            await query.message.edit_text(f"🎛️ **Active Effects:** `{ws.effects}`", reply_markup=fx_menu_kb(ws))
+        if cmd == "show": await query.message.edit_text(f"🎛️ **Active Effects:** `{ws.effects}`", reply_markup=fx_menu_kb(ws))
         elif cmd == "reset":
             ws.effects = {"level": 1.0, "bass": 0.0, "treble": 0.0, "gain": 0.0, "overdrive": 0.0, "echo": None}
-            await ws.save_to_mongo()
-            await ws.reload_streams()
+            await ws.save_to_mongo(); await ws.reload_streams()
             await query.answer("🔄 Reset all effects!", show_alert=True)
         elif cmd in ("level", "bass", "treble", "gain", "overdrive"):
             await query.answer()
             ans = await client.ask(query.message.chat.id, f"🎚️ **Send new value for `{cmd.upper()}`:**", timeout=60)
             ws.effects[cmd] = float(ans.text.strip())
-            await ws.save_to_mongo()
-            await ws.reload_streams()
+            await ws.save_to_mongo(); await ws.reload_streams()
             await ans.reply_text(f"✅ **{cmd.capitalize()} updated!**", reply_markup=fx_menu_kb(ws))
     except MessageNotModified: await query.answer()
-
 
 # ==================== MY ACCOUNTS (DB) ACTIONS ====================
 @bot.on_callback_query(filters.regex(r"^acc_"))
@@ -694,15 +583,10 @@ async def acc_actions_callbacks(client: Client, query: CallbackQuery):
                 ws.recorder_session = s_str
                 await ws.set_recorder(s_str, save=True)
             else:
-                if s_str not in ws.broadcaster_sessions:
-                    ws.broadcaster_sessions.append(s_str)
+                if s_str not in ws.broadcaster_sessions: ws.broadcaster_sessions.append(s_str)
                 await ws.add_broadcaster(s_str, save=True)
-
-            logger.info(f"User {uid} logged in account {me.first_name} via OTP")
             await client.send_message(chat_id, f"✅ **Account Connected!** ({me.first_name})", reply_markup=acc_menu_kb())
-        except Exception as e:
-            logger.error(f"OTP login failure for {uid}: {e}")
-            await client.send_message(chat_id, f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
+        except Exception as e: await client.send_message(chat_id, f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
 
     elif act in ("acc_rec_str", "acc_bcast_str"):
         await query.answer()
@@ -723,14 +607,11 @@ async def acc_actions_callbacks(client: Client, query: CallbackQuery):
                 b_list.append(f"  `{idx+1}.` {bme.first_name} (`{bme.id}`)")
             except Exception: b_list.append(f"  `{idx+1}.` Disconnected")
         b_str = "\n".join(b_list) or f"  📡 {len(ws.broadcaster_sessions)} Saved in DB"
-
         try:
             await query.message.edit_text(
                 f"📋 **Your Saved Accounts (DB & Memory)**\n━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎙️ **Recorder Account:** {rec_status}\n\n"
-                f"📡 **Broadcasters:**\n{b_str}\n━━━━━━━━━━━━━━━━━━━━",
-                reply_markup=acc_menu_kb()
-            )
+                f"📡 **Broadcasters:**\n{b_str}\n━━━━━━━━━━━━━━━━━━━━", reply_markup=acc_menu_kb())
         except MessageNotModified: await query.answer("List is up to date!", show_alert=False)
 
     elif act == "acc_del":
@@ -753,7 +634,6 @@ async def acc_actions_callbacks(client: Client, query: CallbackQuery):
                 await ans.reply_text(f"✅ **Broadcaster #{num} deleted!**", reply_markup=acc_menu_kb())
         except Exception as e: await ans.reply_text(f"❌ **Error:** `{e}`", reply_markup=acc_menu_kb())
 
-
 # ==================== UTILITY & OWNER ACTIONS ====================
 @bot.on_callback_query(filters.regex(r"^util_"))
 async def util_actions(client: Client, query: CallbackQuery):
@@ -771,6 +651,11 @@ async def owner_actions(client: Client, query: CallbackQuery):
         for ws in MANAGER.workspaces.values(): await ws.leave_all()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
+# ==================== TEXT COMMAND FALLBACKS ====================
+@bot.on_message(filters.command(["help", "panel", "ping", "stats", "status", "list", "id"]))
+async def text_cmds(client: Client, message: Message):
+    if not is_authorized(None, None, message): return await handle_unauthorized_user(client, message)
+    await message.reply_text(START_UI.format(mention=message.from_user.mention), reply_markup=main_menu_kb(message.from_user.id))
 
 # ==================== BOOTSTRAP ====================
 async def bootstrap():
