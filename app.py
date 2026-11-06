@@ -1,10 +1,11 @@
-cat << 'EOF' > /opt/Tg-Vc-forward/main.py
+cat << 'EOF' > /opt/Tg-Vc-forward/app.py
 import os
 import sys
 import time
 import asyncio
 import logging
 import subprocess
+import collections
 from typing import Dict, Set, List, Optional
 from cryptography.fernet import Fernet
 
@@ -32,16 +33,17 @@ def decrypt_session(encrypted_string: str) -> str:
     return _cipher.decrypt(encrypted_string.encode()).decode()
 
 # ==================== PYROMOD ANTI-CRASH PATCH ====================
-from pyrogram.handlers.handler import ListenerTypes
+# Uses defaultdict to prevent KeyError without needing to import ListenerTypes
 from pyrogram.client import Client
 
 _orig_start = Client.start
 async def patched_start(self, *args, **kwargs):
-    if not hasattr(self, "listeners") or self.listeners is None:
-        self.listeners = {}
-    for l_type in [ListenerTypes.MESSAGE, ListenerTypes.CALLBACK_QUERY, ListenerTypes.INLINE_QUERY]:
-        if l_type not in self.listeners:
-            self.listeners[l_type] = []
+    if not hasattr(self, "listeners") or not isinstance(self.listeners, dict):
+        self.listeners = collections.defaultdict(list)
+    elif not isinstance(self.listeners, collections.defaultdict):
+        old_listeners = self.listeners
+        self.listeners = collections.defaultdict(list)
+        self.listeners.update(old_listeners)
     return await _orig_start(self, *args, **kwargs)
 Client.start = patched_start
 
@@ -678,3 +680,7 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(bootstrap())
 EOF
+
+# Now restart the service
+sudo systemctl restart tgvcforward.service
+sudo journalctl -u tgvcforward.service -f
