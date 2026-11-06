@@ -1,0 +1,9 @@
+from motor.motor_asyncio import AsyncIOMotorClient
+import config
+
+client = AsyncIOMotorClient(config.MONGO_URI)
+db = client[config.DB_NAME]
+
+users_col = db["users"]
+accounts_col = db["accounts"]
+forwarding_configs = db["forwarding_configs"]
