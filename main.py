@@ -1,3 +1,4 @@
+cat << 'EOF' > /opt/Tg-Vc-forward/main.py
 import os
 import sys
 import time
@@ -676,3 +677,4 @@ async def bootstrap():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(bootstrap())
+EOF
