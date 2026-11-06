@@ -12,4 +12,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Run pulseaudio as root in headless mode before starting python
-CMD pulseaudio -D --exit-idle-time=-1 --system --disallow-exit && python3 main.py
+CMD pulseaudio -D --exit-idle-time=-1 --system --disallow-exit && python3 app.py
