@@ -1,0 +1,10 @@
+from cryptography.fernet import Fernet
+import config
+
+_cipher = Fernet(config.ENCRYPTION_KEY.encode())
+
+def encrypt_session(session_string: str) -> str:
+    return _cipher.encrypt(session_string.encode()).decode()
+
+def decrypt_session(encrypted_string: str) -> str:
+    return _cipher.decrypt(encrypted_string.encode()).decode()
