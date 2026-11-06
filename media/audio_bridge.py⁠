@@ -1,0 +1,77 @@
+import os
+import asyncio
+from typing import Dict
+from pyrogram import Client
+from pytgcalls import PyTgCalls
+from pytgcalls.types import MediaStream, AudioQuality, RecordStream
+from pytgcalls.types.raw import AudioParameters
+from services.encryption import decrypt_session
+from database.mongo import accounts_col, forwarding_configs
+import config
+
+class ActiveRelay:
+    def __init__(self, user_id: int):
+        self.user_id = user_id
+        self.recorder_client = None
+        self.broadcaster_client = None
+        self.recorder_call = None
+        self.broadcaster_call = None
+        self.fifo_path = f"/tmp/nexa_relay_{user_id}.pcm"
+        self.is_active = False
+
+    async def initialize(self, rec_session: str, bcast_session: str):
+        self.recorder_client = Client(f"rec_{self.user_id}", api_id=config.API_ID, api_hash=config.API_HASH, session_string=rec_session, in_memory=True, no_updates=True)
+        self.broadcaster_client = Client(f"bcast_{self.user_id}", api_id=config.API_ID, api_hash=config.API_HASH, session_string=bcast_session, in_memory=True, no_updates=True)
+        await self.recorder_client.start()
+        await self.broadcaster_client.start()
+        self.recorder_call = PyTgCalls(self.recorder_client)
+        self.broadcaster_call = PyTgCalls(self.broadcaster_client)
+        await self.recorder_call.start()
+        await self.broadcaster_call.start()
+        if not os.path.exists(self.fifo_path):
+            os.mkfifo(self.fifo_path)
+
+    def _build_ffmpeg_args(self, fx: dict) -> str:
+        filters = []
+        if fx.get("volume") and fx["volume"] != 100: filters.append(f"volume={fx['volume']/100}")
+        if fx.get("gain"): filters.append(f"volume={fx['gain']}dB")
+        if fx.get("bass"): filters.append(f"bass=g={fx['bass']}:f=110:w=0.6")
+        if fx.get("treble"): filters.append(f"treble=g={fx['treble']}:f=3200:w=0.5")
+        if fx.get("overdrive"): 
+            d = min(max(fx["overdrive"], 1.0), 64.0)
+            filters.append(f"acrusher=level_in={d}:level_out={d*1.5}:bits=8:mode=log:aa=1")
+        if fx.get("echo"): 
+            parts = fx["echo"].split("/")
+            if len(parts) == 2: filters.append(f"aecho=0.8:0.9:{parts[0]}:{parts[1]}")
+        return f"-af {','.join(filters)}" if filters else ""
+
+    async def start_relay(self, source_chat: int, dest_chat: int, fx: dict):
+        # 1. Capture incoming raw PCM
+        await self.recorder_call.record(source_chat, RecordStream(self.fifo_path, AudioParameters(bitrate=48000, channels=2)))
+        
+        # 2. Pipe FIFO through FFmpeg filters back into PyTgCalls
+        af_str = self._build_ffmpeg_args(fx)
+        ffmpeg_params = f"-f s16le {af_str}".strip()
+        
+        stream = MediaStream(self.fifo_path, audio_parameters=AudioQuality.STUDIO, ffmpeg_parameters=ffmpeg_params)
+        await self.broadcaster_call.play(dest_chat, stream)
+        self.is_active = True
+
+    async def reload_effects(self, dest_chat: int, fx: dict):
+        if self.is_active:
+            af_str = self._build_ffmpeg_args(fx)
+            stream = MediaStream(self.fifo_path, audio_parameters=AudioQuality.STUDIO, ffmpeg_parameters=f"-f s16le {af_str}".strip())
+            await self.broadcaster_call.play(dest_chat, stream)
+
+    async def stop(self):
+        try: await self.recorder_call.leave_call()
+        except: pass
+        try: await self.broadcaster_call.leave_call()
+        except: pass
+        try: await self.recorder_client.stop()
+        except: pass
+        try: await self.broadcaster_client.stop()
+        except: pass
+        self.is_active = False
+
+active_relays: Dict[int, ActiveRelay] = {}
