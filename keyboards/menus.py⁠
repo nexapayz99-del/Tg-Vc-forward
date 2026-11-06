@@ -1,0 +1,46 @@
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+def main_menu_kb(is_owner: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("🎙️ Add Record Account", callback_data="add_record"),
+         InlineKeyboardButton("📡 Add Broadcast Account", callback_data="add_broadcast")],
+        [InlineKeyboardButton("📱 My Accounts", callback_data="my_accounts"),
+         InlineKeyboardButton("⚙️ Account Settings", callback_data="acc_settings")],
+        [InlineKeyboardButton("▶️ Start Forwarding", callback_data="start_fwd"),
+         InlineKeyboardButton("⏹️ Stop Forwarding", callback_data="stop_fwd")],
+        [InlineKeyboardButton("🎛️ Audio Effects", callback_data="menu_effects"),
+         InlineKeyboardButton("🔄 Reconnect", callback_data="reconnect_fwd")],
+        [InlineKeyboardButton("📊 Forwarding Statistics", callback_data="stats"),
+         InlineKeyboardButton("📖 Help", callback_data="help")]
+    ]
+    if is_owner:
+        buttons.append([InlineKeyboardButton("👑 Owner Control Panel", callback_data="owner_panel")])
+    return InlineKeyboardMarkup(buttons)
+
+def owner_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 All Users", callback_data="own_users"),
+         InlineKeyboardButton("📩 Pending Requests", callback_data="own_pending")],
+        [InlineKeyboardButton("✅ Approve User", callback_data="own_approve"),
+         InlineKeyboardButton("❌ Remove Access", callback_data="own_revoke")],
+        [InlineKeyboardButton("🚫 Ban User", callback_data="own_ban"),
+         InlineKeyboardButton("🟢 Unban User", callback_data="own_unban")],
+        [InlineKeyboardButton("📊 DB Statistics", callback_data="own_stats"),
+         InlineKeyboardButton("🛑 Stop Relays", callback_data="own_stop_relays")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
+
+def effects_menu_kb(fx: dict) -> InlineKeyboardMarkup:
+    echo_lbl = fx.get("echo") or "Off"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🔊 Vol ({fx.get('volume', 100)}%)", callback_data="fx_volume"),
+         InlineKeyboardButton(f"🎸 Bass ({fx.get('bass', 0)}dB)", callback_data="fx_bass")],
+        [InlineKeyboardButton(f"🎻 Treble ({fx.get('treble', 0)}dB)", callback_data="fx_treble"),
+         InlineKeyboardButton(f"⚡ Gain ({fx.get('gain', 0)}dB)", callback_data="fx_gain")],
+        [InlineKeyboardButton(f"🔥 Overdrive ({fx.get('overdrive', 0)})", callback_data="fx_overdrive"),
+         InlineKeyboardButton(f"🗣️ Echo ({echo_lbl})", callback_data="fx_echo")],
+        [InlineKeyboardButton("🔇 Mute", callback_data="fx_mute"),
+         InlineKeyboardButton("🔊 Unmute", callback_data="fx_unmute")],
+        [InlineKeyboardButton("🔄 Reset Effects", callback_data="fx_reset")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+    ])
